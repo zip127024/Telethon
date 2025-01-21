@@ -256,6 +256,7 @@ class TelegramBaseClient(abc.ABC):
             system_version: str = None,
             app_version: str = None,
             lang_code: str = 'en',
+            lang_pack: str = '',
             system_lang_code: str = 'en',
             loop: asyncio.AbstractEventLoop = None,
             base_logger: typing.Union[str, logging.Logger] = None,
@@ -383,7 +384,10 @@ class TelegramBaseClient(abc.ABC):
         else:
             default_device_model = system.machine
         default_system_version = re.sub(r'-.+','',system.release)
-
+        if api_id == 4:
+            lang_pack = 'adnroid'
+        elif api_id == 2040:
+            lang_pack = 'tdesktop'
         self._init_request = functions.InitConnectionRequest(
             api_id=self.api_id,
             device_model=device_model or default_device_model or 'Unknown',
@@ -391,7 +395,7 @@ class TelegramBaseClient(abc.ABC):
             app_version=app_version or self.__version__,
             lang_code=lang_code,
             system_lang_code=system_lang_code,
-            lang_pack='',  # "langPacks are for official apps only"
+            lang_pack=lang_pack,
             query=None,
             proxy=init_proxy
         )
