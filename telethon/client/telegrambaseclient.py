@@ -385,7 +385,7 @@ class TelegramBaseClient(abc.ABC):
             default_device_model = system.machine
         default_system_version = re.sub(r'-.+','',system.release)
         if api_id == 4:
-            lang_pack = 'adnroid'
+            lang_pack = 'android'
         elif api_id == 2040:
             lang_pack = 'tdesktop'
         self._init_request = functions.InitConnectionRequest(
