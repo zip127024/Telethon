@@ -117,6 +117,7 @@ class UploadMethods:
             *,
             caption: typing.Union[str, typing.Sequence[str]] = None,
             force_document: bool = False,
+            mime_type: str = None,
             file_size: int = None,
             clear_draft: bool = False,
             progress_callback: 'hints.ProgressCallback' = None,
@@ -140,6 +141,8 @@ class UploadMethods:
             comment_to: 'typing.Union[int, types.Message]' = None,
             ttl: int = None,
             nosound_video: bool = None,
+            send_as: typing.Optional['hints.EntityLike'] = None,
+            message_effect_id: typing.Optional[int] = None,
             **kwargs) -> typing.Union[typing.List[typing.Any], typing.Any]:
         """
         Sends message with the given file to the specified entity.
@@ -206,6 +209,13 @@ class UploadMethods:
                 If left to `False` and the file is a path that ends with
                 the extension of an image file or a video file, it will be
                 sent as such. Otherwise always as a document.
+
+            mime_type (`str`, optional):
+                Custom mime type to use for the file to be sent (for example,
+                ``audio/mpeg``, ``audio/x-vorbis+ogg``, etc.).
+                It can change the type of files displayed.
+                If not set to any value, the mime type will be determined
+                automatically based on the file's extension.
 
             file_size (`int`, optional):
                 The size of the file to be uploaded if it needs to be uploaded,
@@ -322,6 +332,16 @@ class UploadMethods:
                 on non-video files. This is set to ``True`` for albums, as gifs
                 cannot be sent in albums.
 
+            send_as (`entity`):
+                Unique identifier (int) or username (str) of the chat or channel to send the message as.
+                You can use this to send the message on behalf of a chat or channel where you have appropriate permissions.
+                Use the GetSendAs to return the list of message sender identifiers, which can be used to send messages in the chat,
+                This setting applies to the current message and will remain effective for future messages unless explicitly changed.
+                To set this behavior permanently for all messages, use SaveDefaultSendAs.
+
+            message_effect_id (`int`, optional):
+                Unique identifier of the message effect to be added to the message; for private chats only
+
         Returns
             The `Message <telethon.tl.custom.message.Message>` (or messages)
             containing the sent file, or messages if a list of them was passed.
@@ -421,6 +441,7 @@ class UploadMethods:
                     parse_mode=parse_mode, silent=silent, schedule=schedule,
                     supports_streaming=supports_streaming, clear_draft=clear_draft,
                     force_document=force_document, background=background,
+                    send_as=send_as, message_effect_id=message_effect_id
                 )
                 file = file[10:]
                 captions = captions[10:]
@@ -437,6 +458,7 @@ class UploadMethods:
 
         file_handle, media, image = await self._file_to_media(
             file, force_document=force_document,
+            mime_type=mime_type,
             file_size=file_size,
             progress_callback=progress_callback,
             attributes=attributes, allow_cache=allow_cache, thumb=thumb,
@@ -455,7 +477,9 @@ class UploadMethods:
             entity, media, reply_to=reply_to, message=caption,
             entities=msg_entities, reply_markup=markup, silent=silent,
             schedule_date=schedule, clear_draft=clear_draft,
-            background=background
+            background=background,
+            send_as=await self.get_input_entity(send_as) if send_as else None,
+            effect=message_effect_id
         )
         return self._get_response_message(request, await self(request), entity)
 
@@ -464,7 +488,9 @@ class UploadMethods:
                           progress_callback=None, reply_to=None,
                           parse_mode=(), silent=None, schedule=None,
                           supports_streaming=None, clear_draft=None,
-                          force_document=False, background=None, ttl=None):
+                          force_document=False, background=None, ttl=None,
+                          send_as: typing.Optional['hints.EntityLike'] = None,
+                          message_effect_id: typing.Optional[int] = None):
         """Specialized version of .send_file for albums"""
         # We don't care if the user wants to avoid cache, we will use it
         # anyway. Why? The cached version will be exactly the same thing
@@ -539,7 +565,9 @@ class UploadMethods:
         request = functions.messages.SendMultiMediaRequest(
             entity, reply_to=None if reply_to is None else types.InputReplyToMessage(reply_to), multi_media=media,
             silent=silent, schedule_date=schedule, clear_draft=clear_draft,
-            background=background
+            background=background,
+            send_as=await self.get_input_entity(send_as) if send_as else None,
+            effect=message_effect_id
         )
         result = await self(request)
 

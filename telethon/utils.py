@@ -95,7 +95,8 @@ def get_display_name(entity):
         else:
             return ''
 
-    elif isinstance(entity, (types.Chat, types.ChatForbidden, types.Channel)):
+    elif isinstance(entity, (
+            types.Chat, types.ChatForbidden, types.Channel, types.ChannelForbidden)):
         return entity.title
 
     return ''
@@ -445,6 +446,7 @@ def get_input_media(
     if isinstance(media, types.MessageMediaPhoto):
         return types.InputMediaPhoto(
             id=get_input_photo(media.photo),
+            spoiler=media.spoiler,
             ttl_seconds=ttl or media.ttl_seconds
         )
 
@@ -498,6 +500,14 @@ def get_input_media(
 
     if isinstance(media, types.MessageMediaGeo):
         return types.InputMediaGeoPoint(geo_point=get_input_geo(media.geo))
+
+    if isinstance(media, types.MessageMediaGeoLive):
+        return types.InputMediaGeoLive(
+            geo_point=get_input_geo(media.geo),
+            period=media.period,
+            heading=media.heading,
+            proximity_notification_radius=media.proximity_notification_radius,
+        )
 
     if isinstance(media, types.MessageMediaVenue):
         return types.InputMediaVenue(
