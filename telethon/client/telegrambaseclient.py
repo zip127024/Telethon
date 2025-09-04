@@ -384,7 +384,7 @@ class TelegramBaseClient(abc.ABC):
         else:
             default_device_model = system.machine
         default_system_version = re.sub(r'-.+','',system.release)
-        if api_id == 4:
+        if api_id in [4, 21724]:
             lang_pack = 'android'
         elif api_id == 2040:
             lang_pack = 'tdesktop'
