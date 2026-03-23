@@ -392,33 +392,6 @@ class TelegramBaseClient(abc.ABC):
         # Remember flood-waited requests to avoid making them again
         self._flood_waited_requests = {}
 
-    @staticmethod
-    def _build_json_params(params: dict):
-        """Convert a Python dict to a TL JsonObject for InitConnectionRequest params."""
-        def _to_json_value(value):
-            if value is None:
-                return types.JsonNull()
-            elif isinstance(value, bool):
-                return types.JsonBool(value=value)
-            elif isinstance(value, (int, float)):
-                return types.JsonNumber(value=float(value))
-            elif isinstance(value, str):
-                return types.JsonString(value=value)
-            elif isinstance(value, (list, tuple)):
-                return types.JsonArray(value=[_to_json_value(v) for v in value])
-            elif isinstance(value, dict):
-                return types.JsonObject(value=[
-                    types.JsonObjectValue(key=k, value=_to_json_value(v))
-                    for k, v in value.items()
-                ])
-            else:
-                return types.JsonString(value=str(value))
-
-        return types.JsonObject(value=[
-            types.JsonObjectValue(key=k, value=_to_json_value(v))
-            for k, v in params.items()
-        ])
-
         # Cache ``{dc_id: (_ExportState, MTProtoSender)}`` for all borrowed senders
         self._borrowed_senders = {}
         self._borrow_sender_lock = asyncio.Lock()
@@ -485,6 +458,33 @@ class TelegramBaseClient(abc.ABC):
 
 
     # endregion
+
+    @staticmethod
+    def _build_json_params(params: dict):
+        """Convert a Python dict to a TL JsonObject for InitConnectionRequest params."""
+        def _to_json_value(value):
+            if value is None:
+                return types.JsonNull()
+            elif isinstance(value, bool):
+                return types.JsonBool(value=value)
+            elif isinstance(value, (int, float)):
+                return types.JsonNumber(value=float(value))
+            elif isinstance(value, str):
+                return types.JsonString(value=value)
+            elif isinstance(value, (list, tuple)):
+                return types.JsonArray(value=[_to_json_value(v) for v in value])
+            elif isinstance(value, dict):
+                return types.JsonObject(value=[
+                    types.JsonObjectValue(key=k, value=_to_json_value(v))
+                    for k, v in value.items()
+                ])
+            else:
+                return types.JsonString(value=str(value))
+
+        return types.JsonObject(value=[
+            types.JsonObjectValue(key=k, value=_to_json_value(v))
+            for k, v in params.items()
+        ])
 
     # region Properties
 
