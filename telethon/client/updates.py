@@ -9,7 +9,16 @@ import typing
 import logging
 import warnings
 from collections import deque
-import sqlite3
+
+try:
+    import sqlite3
+
+    OperationalError = sqlite3.OperationalError
+except ImportError as e:
+    sqlite3 = None
+
+    class OperationalError(Exception):
+        pass  # won't be created and thus never caught
 
 from .. import events, utils, errors
 from ..events.common import EventBuilder, EventCommon
@@ -325,13 +334,22 @@ class UpdateMethods:
                             await self.disconnect()
                             break
                         continue
-                    except (errors.TypeNotFoundError, sqlite3.OperationalError) as e:
+                    except (errors.TypeNotFoundError, OperationalError) as e:
                         # User is likely doing weird things with their account or session and Telegram gets confused as to what layer they use
                         self._log[__name__].warning('Cannot get difference since the account is likely misusing the session: %s', e)
                         self._message_box.end_difference()
                         self._updates_error = e
                         await self.disconnect()
                         break
+                    except errors.RPCError as e:
+                        # Fallback; treat as transient error (the amount of "fatal errors" reported seem to indicate this is most likely what we need to do)
+                        self._log[__name__].warning(
+                            "Cannot get difference due to unexpected error (this may be a bug "
+                            f"in Telethon v{__version__} in that it could be handled better, but it's unlikely): %s",
+                            e
+                        )
+                        self._message_box.end_difference()
+                        continue
                     except OSError as e:
                         # Network is likely down, but it's unclear for how long.
                         # If disconnect is called this task will be cancelled along with the sleep.
@@ -368,7 +386,7 @@ class UpdateMethods:
                             await self.disconnect()
                             break
                         continue
-                    except (errors.TypeNotFoundError, sqlite3.OperationalError) as e:
+                    except (errors.TypeNotFoundError, OperationalError) as e:
                         self._log[__name__].warning(
                             'Cannot get difference for channel %s since the account is likely misusing the session: %s',
                             get_diff.channel.channel_id, e
@@ -427,6 +445,19 @@ class UpdateMethods:
                         self._message_box.end_channel_difference(
                             get_diff,
                             PrematureEndReason.BANNED,
+                            self._mb_entity_cache
+                        )
+                        continue
+                    except errors.RPCError as e:
+                        # Fallback; treat as transient error (the amount of "fatal errors" reported seem to indicate this is most likely what we need to do)
+                        self._log[__name__].warning(
+                            "Cannot get difference for channel %d due to unexpected error (this may be a bug "
+                            f"in Telethon v{__version__} in that it could be handled better, but it's unlikely): %s",
+                            get_diff.channel.channel_id, e
+                        )
+                        self._message_box.end_channel_difference(
+                            get_diff,
+                            PrematureEndReason.TEMPORARY_SERVER_ISSUES,
                             self._mb_entity_cache
                         )
                         continue

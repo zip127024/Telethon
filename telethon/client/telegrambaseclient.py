@@ -9,6 +9,7 @@ import time
 import typing
 import datetime
 import pathlib
+import warnings
 
 from .. import utils, version, helpers, __name__ as __base_name__
 from ..crypto import rsa
@@ -18,6 +19,11 @@ from ..sessions import Session, SQLiteSession, MemorySession
 from ..tl import functions, types
 from ..tl.alltlobjects import LAYER
 from .._updates import MessageBox, EntityCache as MbEntityCache, SessionState, ChannelState, Entity, EntityType
+
+try:
+    import python_socks
+except ImportError:
+    python_socks = None
 
 DEFAULT_DC_ID = 2
 DEFAULT_IPV4_IP = '149.154.167.51'
@@ -104,12 +110,12 @@ class TelegramBaseClient(abc.ABC):
             By default this is `False` as IPv6 support is not
             too widespread yet.
 
-        proxy (`tuple` | `list` | `dict`, optional):
+        proxy (`dict`, optional):
             An iterable consisting of the proxy info. If `connection` is
             one of `MTProxy`, then it should contain MTProxy credentials:
-            ``('hostname', port, 'secret')``. Otherwise, it's meant to store
-            function parameters for PySocks, like ``(type, 'hostname', port)``.
-            See https://github.com/Anorov/PySocks#usage-1 for more.
+            ``hostname, port, secret``. Otherwise, it's meant to store
+            function parameters for PySocks, like ``type, hostname, port``.
+            See https://github.com/romis2012/python-socks for more.
 
         local_addr (`str` | `tuple`, optional):
             Local host address (and port, optionally) used to bind the socket to locally.
@@ -340,6 +346,9 @@ class TelegramBaseClient(abc.ABC):
         self._local_addr = local_addr
         self._timeout = timeout
         self._auto_reconnect = auto_reconnect
+
+        if proxy and not python_socks:
+            warnings.warn('proxy argument will be ignored because python-socks is not installed')
 
         assert isinstance(connection, type)
         self._connection = connection

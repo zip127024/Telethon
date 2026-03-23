@@ -1,3 +1,7 @@
+Moved to https://codeberg.org/Lonami/Telethon. The GitHub repository may be deleted in the future.
+
+----
+
 Telethon
 ========
 .. epigraph::
