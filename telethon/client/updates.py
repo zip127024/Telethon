@@ -487,6 +487,10 @@ class UpdateMethods:
                         self._log[__name__].debug('Timeout waiting for updates expired')
                         continue
                 else:
+                    # Yield control to the event loop to prevent busy-waiting
+                    # when all deadlines have already expired (deadline_delay <= 0).
+                    # Without this sleep the while-loop spins at 100 % CPU.
+                    await asyncio.sleep(0.1)
                     continue
 
                 processed = []
