@@ -563,6 +563,11 @@ class MTProtoSender:
             except Exception:
                 self._log.exception('Unhandled error while processing msgs')
 
+            # Yield to event loop after processing each message to prevent
+            # CPU saturation when receiving a high volume of updates
+            # (e.g. accounts subscribed to hundreds of channels).
+            await asyncio.sleep(0)
+
     # Response Handlers
 
     async def _process_message(self, message):

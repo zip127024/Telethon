@@ -43,7 +43,7 @@ POSSIBLE_GAP_TIMEOUT = 0.5
 # client will resume normal operation, and the timeout will reset.
 #
 # Documentation recommends 15 minutes without updates (https://core.telegram.org/api/updates).
-NO_UPDATES_TIMEOUT = 15 * 60
+NO_UPDATES_TIMEOUT = 30 * 60  # Increased from 15 to 30 min to reduce CPU load on accounts with many channels
 
 # object() but with a tag to make it easier to debug
 class Sentinel:

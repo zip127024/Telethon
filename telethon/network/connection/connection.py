@@ -357,6 +357,10 @@ class Connection(abc.ABC):
                     await self.disconnect()
                 else:
                     await self._recv_queue.put((data, None))
+                    # Yield to event loop after each received packet to prevent
+                    # the recv loop from monopolizing the CPU when data arrives
+                    # faster than the application can process it.
+                    await asyncio.sleep(0)
         finally:
             await self.disconnect()
 
