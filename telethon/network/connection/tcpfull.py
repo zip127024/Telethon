@@ -1,4 +1,3 @@
-import asyncio
 import struct
 from zlib import crc32
 
@@ -23,10 +22,12 @@ class FullPacketCodec(PacketCodec):
         return data + crc
 
     async def read_packet(self, reader):
-        try:
-            packet_len_seq = await reader.readexactly(8)  # 4 and 4
-        except asyncio.IncompleteReadError as exc:
-            return exc.partial
+        # Do NOT catch IncompleteReadError here: it means the connection is
+        # at EOF.  Returning partial data would cause the recv_loop to spin
+        # at 100% CPU because the next readexactly() would immediately fail
+        # again on the exhausted stream.  Let the exception propagate so
+        # that _recv_loop handles it as a connection closure.
+        packet_len_seq = await reader.readexactly(8)  # 4 and 4
         packet_len, seq = struct.unpack('<ii', packet_len_seq)
         if packet_len < 0 and seq < 0:
             # It has been observed that the length and seq can be -429,
