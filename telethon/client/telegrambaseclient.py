@@ -254,10 +254,12 @@ class TelegramBaseClient(abc.ABC):
             Telegram stores the API layer per authorization key, so another
             program using the same session with another layer makes Telegram
             send objects this library cannot read (`TypeNotFoundError`).
-            When that happens the connection is re-initialized with our layer
-            and the request is retried once. This is the maximum amount of
-            such re-initializations per `layer_recovery_window`; after that
-            `LayerConflictError` is raised. Defaults to 3; 0 disables it.
+            If this is positive, the connection is then re-initialized with
+            our layer and the request is retried once; this is the maximum
+            amount of such re-initializations per `layer_recovery_window`,
+            after that `LayerConflictError` is raised. Defaults to 0
+            (disabled): using one session from two programs at the same time
+            risks the account, so by default the error is raised right away.
 
         layer_recovery_window (`float`, optional):
             The window, in seconds, for `layer_recovery_limit`.
@@ -303,7 +305,7 @@ class TelegramBaseClient(abc.ABC):
             catch_up: bool = False,
             entity_cache_limit: int = 5000,
             init_params: dict = None,
-            layer_recovery_limit: int = 3,
+            layer_recovery_limit: int = 0,
             layer_recovery_window: float = 600
     ):
         if not api_id or not api_hash:

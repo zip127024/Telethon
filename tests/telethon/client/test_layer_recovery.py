@@ -28,6 +28,7 @@ class FakeSender:
 
 
 def make_client(receive_updates=True, **kwargs):
+    kwargs.setdefault('layer_recovery_limit', 3)  # disabled by default
     client = TelegramClient(
         MemorySession(), 4, 'hash', device_model='Realme8i', system_version='SDK 30',
         app_version='12.9.2', lang_code='ru', system_lang_code='ru-ru',
@@ -141,6 +142,17 @@ async def test_disabled():
         await client._call(client.fake_sender, 'X')
     assert not isinstance(info.value, errors.LayerConflictError)
     assert client.fake_sender.sent == []
+
+    client._handle_unknown_pushed_type(client.fake_sender, errors.TypeNotFoundError(FOREIGN_MESSAGE, b''))
+    assert client._layer_recovery_task is None and client.fake_sender.sent == []
+
+
+def test_disabled_by_default():
+    # Using one session from two programs at once risks the account, so the
+    # error must surface right away unless a project opts in.
+    assert inspect.signature(TelegramClient.__init__).parameters['layer_recovery_limit'].default == 0
+    client = TelegramClient(MemorySession(), 4, 'hash')
+    assert client._layer_recovery_limit == 0
 
 
 @pytest.mark.asyncio

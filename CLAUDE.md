@@ -39,8 +39,9 @@ python -m pytest -q tests
 Telegram хранит слой API **на auth key**: соединение, последним отправившее `invokeWithLayer(initConnection)`, определяет слой объектов для **всех** соединений этого ключа (даже после своего отключения). Если тот же `.session` использует программа с другим слоем (другой Telethon/Pyrogram), нам приходят неизвестные конструкторы -> `TypeNotFoundError`.
 
 * `UserMethods._call` (users.py) — на `TypeNotFoundError` переотправляет `invokeWithLayer(LAYER, [invokeWithoutUpdates](initConnection(help.getConfig)))` на том же sender с **копией** `_init_request` (fingerprint и `init_params` сохраняются) и повторяет запрос один раз. Тело upstream `_call` не менялось, только переименовано в `_call_unguarded`.
-* Лимит: `layer_recovery_limit` (по умолчанию 3, `0` — выключить) за `layer_recovery_window` секунд (600). Дальше — `errors.LayerConflictError` (подкласс `TypeNotFoundError`, старые `except` продолжают работать; `_update_loop` на нём, как и раньше, отключает клиент при getDifference).
-* Push-апдейты: `MTProtoSender._recv_loop` раньше молча выбрасывал нечитаемые апдейты (бот «слеп» до getDifference, до 30 мин). Теперь sender вызывает `type_not_found_callback`, клиент переинициализирует слой в фоне (debounce 10 с, тот же лимит).
+* **По умолчанию ВЫКЛЮЧЕНО** (`layer_recovery_limit=0`, решение владельца 2026-10-08): одновременная работа двух программ на одной сессии неминуемо ведёт к бану аккаунта, поэтому бот не должен «бороться» за слой — ошибка `TypeNotFoundError` поднимается сразу, как до обновления (в `_update_loop` при getDifference клиент отключается). Не менять дефолт без согласования.
+* Включается в проекте явно: `layer_recovery_limit=N` переинициализаций за `layer_recovery_window` секунд (600). После лимита — `errors.LayerConflictError` (подкласс `TypeNotFoundError`, старые `except` продолжают работать).
+* Push-апдейты: `MTProtoSender._recv_loop` раньше молча выбрасывал нечитаемые апдейты (бот «слеп» до getDifference, до 30 мин). Теперь sender вызывает `type_not_found_callback`, клиент переинициализирует слой в фоне (только если восстановление включено; debounce 10 с, тот же лимит).
 * Тесты: `tests/telethon/client/test_layer_recovery.py`.
 ### Поддержка CDN (скачивание файлов через CDN дата-центры)
 
