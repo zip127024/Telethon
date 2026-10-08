@@ -76,28 +76,37 @@ class Dialog:
 
         is_channel (`bool`):
             `True` if the `entity` is a :tl:`Channel`.
+
+        is_community (`bool`):
+            `True` if the `entity` is a :tl:`Community`. The original
+            ``dialog`` may then be a :tl:`DialogCommunity`, which has no
+            last message, folder or unread counters.
     """
     def __init__(self, client, dialog, entities, message):
         # Both entities and messages being dicts {ID: item}
         self._client = client
         self.dialog = dialog
         self.pinned = bool(dialog.pinned)
-        self.folder_id = dialog.folder_id
-        self.archived = dialog.folder_id is not None
+        self.folder_id = getattr(dialog, 'folder_id', None)
+        self.archived = self.folder_id is not None
         self.message = message
         self.date = getattr(self.message, 'date', None)
 
-        self.entity = entities[utils.get_peer_id(dialog.peer)]
+        if isinstance(dialog, types.DialogCommunity):
+            peer = types.PeerChannel(dialog.community_id)
+        else:
+            peer = dialog.peer
+        self.entity = entities[utils.get_peer_id(peer)]
         self.input_entity = utils.get_input_peer(self.entity)
         self.id = utils.get_peer_id(self.entity)  # ^ May be InputPeerSelf()
         self.name = self.title = utils.get_display_name(self.entity)
 
-        self.unread_count = dialog.unread_count
-        self.unread_mentions_count = dialog.unread_mentions_count
-        self.unread_reactions_count = dialog.unread_reactions_count
-        self.unread_poll_votes_count = dialog.unread_poll_votes_count
+        self.unread_count = getattr(dialog, 'unread_count', 0)
+        self.unread_mentions_count = getattr(dialog, 'unread_mentions_count', 0)
+        self.unread_reactions_count = getattr(dialog, 'unread_reactions_count', 0)
+        self.unread_poll_votes_count = getattr(dialog, 'unread_poll_votes_count', 0)
 
-        self.draft = Draft(client, self.entity, self.dialog.draft)
+        self.draft = Draft(client, self.entity, getattr(dialog, 'draft', None))
 
         self.is_user = isinstance(self.entity, types.User)
         self.is_group = (

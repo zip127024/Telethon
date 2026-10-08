@@ -56,3 +56,28 @@ def test_private_get_extension():
 
 def test_rle_encode_trailing_zeros():
     assert utils._rle_encode(b'\x12\x00\x00\x00\x00') == b'\x12\x00\x04'
+
+
+def test_quiz_poll_input_media_correct_answers_are_indices():
+    # Since layer 223 inputMediaPoll.correct_answers is Vector<int>: the
+    # indices of the correct answers in poll.answers, no longer their options.
+    from telethon.tl.types import (
+        MessageMediaPoll, Poll, PollAnswer, PollResults, PollAnswerVoters,
+        TextWithEntities, InputMediaPoll
+    )
+
+    def answer(text, option):
+        return PollAnswer(TextWithEntities(text, []), option)
+
+    poll = Poll(id=1, question=TextWithEntities('q', []), hash=0, quiz=True, answers=[
+        answer('a', b'0'), answer('b', b'1'), answer('c', b'2')])
+    media = MessageMediaPoll(poll, PollResults(results=[
+        PollAnswerVoters(b'0', voters=1),
+        PollAnswerVoters(b'2', correct=True, voters=4),
+    ], solution='because', solution_entities=[]))
+
+    input_media = utils.get_input_media(media)
+    assert isinstance(input_media, InputMediaPoll)
+    assert input_media.correct_answers == [2]
+    assert input_media.solution == 'because'
+    bytes(input_media)  # must serialize

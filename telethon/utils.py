@@ -553,7 +553,11 @@ def get_input_media(
                 # If the quiz hasn't been answered we can't reconstruct it properly.
                 raise TypeError('Cannot cast unanswered quiz to any kind of InputMedia.')
 
-            correct_answers = [r.option for r in media.results.results if r.correct]
+            # correct_answers are indices into poll.answers (layer 223+),
+            # not the answers' options.
+            correct_options = {r.option for r in media.results.results if r.correct}
+            correct_answers = [i for i, a in enumerate(media.poll.answers)
+                               if getattr(a, 'option', None) in correct_options]
         else:
             correct_answers = None
 

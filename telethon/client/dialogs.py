@@ -24,6 +24,18 @@ def _dialog_message_key(peer, message_id):
     return (peer.channel_id if isinstance(peer, types.PeerChannel) else None), message_id
 
 
+def _dialog_peer(dialog):
+    """
+    Get the :tl:`Peer` of a :tl:`Dialog`.
+
+    :tl:`DialogCommunity` has no ``peer`` (nor ``top_message``), only the
+    ``community_id``, and communities are addressed as channels everywhere.
+    """
+    if isinstance(dialog, types.DialogCommunity):
+        return types.PeerChannel(dialog.community_id)
+    return dialog.peer
+
+
 class _DialogsIter(RequestIter):
     async def _init(
             self, offset_date, offset_id, offset_peer, ignore_pinned, ignore_migrated, folder
@@ -66,14 +78,15 @@ class _DialogsIter(RequestIter):
             messages[_dialog_message_key(m.peer_id, m.id)] = m
 
         for d in r.dialogs:
+            peer = _dialog_peer(d)
             # We check the offset date here because Telegram may ignore it
-            message = messages.get(_dialog_message_key(d.peer, d.top_message))
+            message = messages.get(_dialog_message_key(peer, getattr(d, 'top_message', None)))
             if self.offset_date:
                 date = getattr(message, 'date', None)
                 if not date or date.timestamp() > self.offset_date.timestamp():
                     continue
 
-            peer_id = utils.get_peer_id(d.peer)
+            peer_id = utils.get_peer_id(peer)
             if peer_id not in self.seen:
                 self.seen.add(peer_id)
                 if peer_id not in entities:
@@ -83,9 +96,9 @@ class _DialogsIter(RequestIter):
                     continue
 
                 cd = custom.Dialog(self.client, d, entities, message)
-                if cd.dialog.pts:
+                if getattr(cd.dialog, 'pts', None):
                     self.client._message_box.try_set_channel_state(
-                        utils.get_peer_id(d.peer, add_mark=False), cd.dialog.pts)
+                        utils.get_peer_id(peer, add_mark=False), cd.dialog.pts)
 
                 if not self.ignore_migrated or getattr(
                         cd.entity, 'migrated_to', None) is None:
@@ -103,7 +116,7 @@ class _DialogsIter(RequestIter):
         # in this list. Instead, we find the last dialog which
         # has a message, and use it as an offset.
         last_message = next(filter(None, (
-            messages.get(_dialog_message_key(d.peer, d.top_message))
+            messages.get(_dialog_message_key(_dialog_peer(d), getattr(d, 'top_message', None)))
             for d in reversed(r.dialogs)
         )), None)
 
@@ -132,7 +145,7 @@ class _DraftsIter(RequestIter):
                     for x in itertools.chain(r.users, r.chats)}
 
         self.buffer.extend(
-            custom.Draft(self.client, entities[utils.get_peer_id(d.peer)], d.draft)
+            custom.Draft(self.client, entities[utils.get_peer_id(_dialog_peer(d))], getattr(d, 'draft', None))
             for d in items
         )
 
