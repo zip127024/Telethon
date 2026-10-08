@@ -3,103 +3,93 @@ This module holds the CdnDecrypter utility class.
 """
 from hashlib import sha256
 
-from ..tl.functions.upload import GetCdnFileRequest, ReuploadCdnFileRequest
-from ..tl.types.upload import CdnFileReuploadNeeded, CdnFile
-from ..crypto import AESModeCTR
+import pyaes
+
 from ..errors import CdnFileTamperedError
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    Cipher = None
+
+
+def _ctr_cryptography(key, iv, data):
+    decryptor = Cipher(algorithms.AES(key), modes.CTR(iv)).decryptor()
+    return decryptor.update(data) + decryptor.finalize()
+
+
+def _ctr_pyaes(key, iv, data):
+    counter = pyaes.Counter(int.from_bytes(iv, 'big'))
+    return pyaes.AESModeOfOperationCTR(key, counter=counter).decrypt(data)
 
 
 class CdnDecrypter:
     """
-    Used when downloading a file results in a 'FileCdnRedirect' to
-    both prepare the redirect, decrypt the file as it downloads, and
-    ensure the file hasn't been tampered. https://core.telegram.org/cdn
+    Decrypts and verifies the parts of a file that Telegram redirected to
+    a CDN data center (``upload.fileCdnRedirect``). https://core.telegram.org/cdn
+
+    The parts are encrypted with AES-256-CTR and, since CDNs are not trusted,
+    every part must match the SHA-256 hashes the file's own DC gives out.
     """
-    def __init__(self, cdn_client, file_token, cdn_aes, cdn_file_hashes):
+    # Pure-Python AES takes seconds per MB, too long for the event loop
+    slow = Cipher is None
+
+    def __init__(self, encryption_key, encryption_iv, file_hashes=()):
         """
-        Initializes the CDN decrypter.
-
-        :param cdn_client: a client connected to a CDN.
-        :param file_token: the token of the file to be used.
-        :param cdn_aes: the AES CTR used to decrypt the file.
-        :param cdn_file_hashes: the hashes the decrypted file must match.
+        :param encryption_key: the ``encryption_key`` of the redirect.
+        :param encryption_iv: the ``encryption_iv`` of the redirect.
+        :param file_hashes: the :tl:`FileHash` known so far.
         """
-        self.client = cdn_client
-        self.file_token = file_token
-        self.cdn_aes = cdn_aes
-        self.cdn_file_hashes = cdn_file_hashes
+        self.key = bytes(encryption_key)
+        self.iv = bytes(encryption_iv)
+        self.hashes = {}
+        self.add_hashes(file_hashes)
 
-    @staticmethod
-    async def prepare_decrypter(client, cdn_client, cdn_redirect):
+    def add_hashes(self, file_hashes):
+        """Remembers more :tl:`FileHash` (e.g. ``upload.getCdnFileHashes``)."""
+        for file_hash in file_hashes or ():
+            self.hashes[file_hash.offset] = file_hash
+
+    def get_hash(self, offset):
+        """Returns the :tl:`FileHash` covering ``offset``, or `None`."""
+        file_hash = self.hashes.get(offset)
+        if file_hash is not None:
+            return file_hash
+        return next((h for h in self.hashes.values()
+                     if h.offset <= offset < h.offset + h.limit), None)
+
+    def decrypt(self, offset, data):
         """
-        Prepares a new CDN decrypter.
-
-        :param client: a TelegramClient connected to the main servers.
-        :param cdn_client: a new client connected to the CDN.
-        :param cdn_redirect: the redirect file object that caused this call.
-        :return: (CdnDecrypter, first chunk file data)
+        Decrypts the part of the file starting at ``offset`` (a multiple of
+        16) with AES-256-CTR: the IV is ``encryption_iv`` with its last
+        4 bytes replaced by the big-endian ``offset / 16``.
         """
-        cdn_aes = AESModeCTR(
-            key=cdn_redirect.encryption_key,
-            # 12 first bytes of the IV..4 bytes of the offset (0, big endian)
-            iv=cdn_redirect.encryption_iv[:12] + bytes(4)
-        )
+        if offset % 16:
+            raise ValueError('CDN offset must be a multiple of 16, got {}'.format(offset))
+        iv = self.iv[:12] + (offset // 16).to_bytes(4, 'big')
+        ctr = _ctr_pyaes if self.slow else _ctr_cryptography
+        return ctr(self.key, iv, bytes(data))
 
-        # We assume that cdn_redirect.cdn_file_hashes are ordered by offset,
-        # and that there will be enough of these to retrieve the whole file.
-        decrypter = CdnDecrypter(
-            cdn_client, cdn_redirect.file_token,
-            cdn_aes, cdn_redirect.cdn_file_hashes
-        )
-
-        cdn_file = await cdn_client(GetCdnFileRequest(
-            file_token=cdn_redirect.file_token,
-            offset=cdn_redirect.cdn_file_hashes[0].offset,
-            limit=cdn_redirect.cdn_file_hashes[0].limit
-        ))
-        if isinstance(cdn_file, CdnFileReuploadNeeded):
-            # We need to use the original client here
-            await client(ReuploadCdnFileRequest(
-                file_token=cdn_redirect.file_token,
-                request_token=cdn_file.request_token
-            ))
-
-            # We want to always return a valid upload.CdnFile
-            cdn_file = decrypter.get_file()
-        else:
-            cdn_file.bytes = decrypter.cdn_aes.encrypt(cdn_file.bytes)
-            cdn_hash = decrypter.cdn_file_hashes.pop(0)
-            decrypter.check(cdn_file.bytes, cdn_hash)
-
-        return decrypter, cdn_file
-
-    def get_file(self):
+    def verify(self, offset, data, eof):
         """
-        Calls GetCdnFileRequest and decrypts its bytes.
-        Also ensures that the file hasn't been tampered.
+        Checks the hashes of the decrypted ``data`` of the file, which starts
+        at ``offset``, the start of a hashed range. All the hashes must be
+        known (see `get_hash`).
 
-        :return: the CdnFile result.
+        Raises `CdnFileTamperedError` on mismatch. Returns how many leading
+        bytes were verified: a range ``data`` ends in the middle of can only
+        be verified if it is the end of the file (``eof``).
         """
-        if self.cdn_file_hashes:
-            cdn_hash = self.cdn_file_hashes.pop(0)
-            cdn_file = self.client(GetCdnFileRequest(
-                self.file_token, cdn_hash.offset, cdn_hash.limit
-            ))
-            cdn_file.bytes = self.cdn_aes.encrypt(cdn_file.bytes)
-            self.check(cdn_file.bytes, cdn_hash)
-        else:
-            cdn_file = CdnFile(bytes(0))
-
-        return cdn_file
-
-    @staticmethod
-    def check(data, cdn_hash):
-        """
-        Checks the integrity of the given data.
-        Raises CdnFileTamperedError if the integrity check fails.
-
-        :param data: the data to be hashed.
-        :param cdn_hash: the expected hash.
-        """
-        if sha256(data).digest() != cdn_hash.hash:
-            raise CdnFileTamperedError()
+        position = offset
+        end = offset + len(data)
+        while position < end:
+            file_hash = self.hashes.get(position)
+            if file_hash is None:
+                raise CdnFileTamperedError()  # no hash starts here
+            piece = data[position - offset:position - offset + file_hash.limit]
+            if len(piece) < file_hash.limit and not eof:
+                break
+            if sha256(piece).digest() != file_hash.hash:
+                raise CdnFileTamperedError()
+            position += len(piece)
+        return position - offset

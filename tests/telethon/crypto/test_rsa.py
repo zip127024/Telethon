@@ -40,3 +40,19 @@ def test_encryption_current_key(server_key_fp):
     # We can't verify the data is actually valid because we don't have
     # the decryption keys
     assert data is not None and len(data) == 256
+
+
+def test_encryption_pad_keys(server_key_fp):
+    assert rsa.encrypt_pad("invalid", b"testdata") is None
+    assert rsa.encrypt_pad(server_key_fp(old=True), b"testdata") is None
+    data = rsa.encrypt_pad(server_key_fp(old=True), b"testdata", use_old=True)
+    assert data is not None and len(data) == 256
+    data = rsa.encrypt_pad(server_key_fp(old=False), b"testdata")
+    assert data is not None and len(data) == 256
+
+
+def test_encryption_pad_data_limit(server_key_fp):
+    # RSA_PAD pads the data to 192 bytes, of which 144 at most may be data
+    assert len(rsa.encrypt_pad(server_key_fp(old=False), bytes(144))) == 256
+    with pytest.raises(ValueError):
+        rsa.encrypt_pad(server_key_fp(old=False), bytes(145))

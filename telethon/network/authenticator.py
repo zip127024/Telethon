@@ -7,7 +7,7 @@ import time
 from hashlib import sha1
 
 from ..tl.types import (
-    ResPQ, PQInnerData, ServerDHParamsFail, ServerDHParamsOk,
+    ResPQ, PQInnerData, PQInnerDataDc, ServerDHParamsFail, ServerDHParamsOk,
     ServerDHInnerData, ClientDHInnerData, DhGenOk, DhGenRetry, DhGenFail
 )
 from .. import helpers
@@ -19,11 +19,17 @@ from ..tl.functions import (
 )
 
 
-async def do_authentication(sender):
+async def do_authentication(sender, dc_id=None):
     """
     Executes the authentication process with the Telegram servers.
 
     :param sender: a connected `MTProtoPlainSender`.
+    :param dc_id:
+        the ``dc`` of ``p_q_inner_data_dc``: the ID of the DC the sender is
+        connected to, plus 10000 on test servers, negative for media-only DCs.
+        It is encrypted with RSA_PAD, as official clients do; CDN DCs reject
+        anything else. If `None`, the legacy ``p_q_inner_data`` encrypted
+        with the legacy RSA scheme is sent instead.
     :return: returns a (authorization key, time offset) tuple.
     """
     # Step 1 sending: PQ Request, endianness doesn't matter since it's random
@@ -41,17 +47,28 @@ async def do_authentication(sender):
     p, q = rsa.get_byte_array(p), rsa.get_byte_array(q)
     new_nonce = int.from_bytes(os.urandom(32), 'little', signed=True)
 
-    pq_inner_data = bytes(PQInnerData(
-        pq=rsa.get_byte_array(pq), p=p, q=q,
-        nonce=res_pq.nonce,
-        server_nonce=res_pq.server_nonce,
-        new_nonce=new_nonce
-    ))
+    if dc_id is None:
+        pq_inner_data = bytes(PQInnerData(
+            pq=rsa.get_byte_array(pq), p=p, q=q,
+            nonce=res_pq.nonce,
+            server_nonce=res_pq.server_nonce,
+            new_nonce=new_nonce
+        ))
+        # sha_digest + data + random_bytes
+        encrypt = rsa.encrypt
+    else:
+        pq_inner_data = bytes(PQInnerDataDc(
+            pq=rsa.get_byte_array(pq), p=p, q=q,
+            nonce=res_pq.nonce,
+            server_nonce=res_pq.server_nonce,
+            new_nonce=new_nonce,
+            dc=dc_id
+        ))
+        encrypt = rsa.encrypt_pad
 
-    # sha_digest + data + random_bytes
     cipher_text, target_fingerprint = None, None
     for fingerprint in res_pq.server_public_key_fingerprints:
-        cipher_text = rsa.encrypt(fingerprint, pq_inner_data)
+        cipher_text = encrypt(fingerprint, pq_inner_data)
         if cipher_text is not None:
             target_fingerprint = fingerprint
             break
@@ -59,7 +76,7 @@ async def do_authentication(sender):
     if cipher_text is None:
         # Second attempt, but now we're allowed to use old keys
         for fingerprint in res_pq.server_public_key_fingerprints:
-            cipher_text = rsa.encrypt(fingerprint, pq_inner_data, use_old=True)
+            cipher_text = encrypt(fingerprint, pq_inner_data, use_old=True)
             if cipher_text is not None:
                 target_fingerprint = fingerprint
                 break

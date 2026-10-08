@@ -76,6 +76,10 @@ class MTProtoSender:
         self._send_loop_handle = None
         self._recv_loop_handle = None
 
+        # ``dc`` of p_q_inner_data_dc when generating an auth key (CDN DCs),
+        # or None for the legacy p_q_inner_data (see connect / _try_gen_auth_key).
+        self._auth_dc_id = None
+
         # Preserving the references of the AuthKey and state is important
         self.auth_key = auth_key or AuthKey(None)
         self._state = MTProtoState(self.auth_key, loggers=self._loggers)
@@ -120,9 +124,16 @@ class MTProtoSender:
 
     # Public API
 
-    async def connect(self, connection):
+    async def connect(self, connection, *, auth_dc_id=None):
         """
         Connects to the specified given connection using the given auth key.
+
+        If a new auth key has to be generated and ``auth_dc_id`` is not
+        `None`, ``p_q_inner_data_dc`` carrying that DC ID (encrypted with
+        RSA_PAD) is sent instead of the legacy ``p_q_inner_data`` (see
+        `authenticator.do_authentication`). Only CDN data centers require
+        (and regular data centers reject) the former, so it defaults to the
+        legacy scheme that every regular DC accepts.
         """
         async with self._connect_lock:
             if self._user_connected:
@@ -130,6 +141,7 @@ class MTProtoSender:
                 return False
 
             self._connection = connection
+            self._auth_dc_id = auth_dc_id
             await self._connect()
             self._user_connected = True
             return True
@@ -301,7 +313,7 @@ class MTProtoSender:
         try:
             self._log.debug('New auth_key attempt %d...', attempt)
             self.auth_key.key, self._state.time_offset = \
-                await authenticator.do_authentication(plain)
+                await authenticator.do_authentication(plain, dc_id=self._auth_dc_id)
 
             # This is *EXTREMELY* important since we don't control
             # external references to the authorization key, we must
@@ -316,6 +328,12 @@ class MTProtoSender:
             self._log.warning('Attempt %d at new auth_key failed: %s', attempt, e)
             await asyncio.sleep(self._delay)
             return False
+        except InvalidBufferError as e:
+            # The server dropped the handshake with a transport error (a DC
+            # answers -404 when the wrong auth scheme is used for it). Retried
+            # like a closed connection by ``_connect`` (ConnectionError is an
+            # OSError), instead of propagating as an unhandled BufferError.
+            raise ConnectionError('auth_key generation refused: {}'.format(e)) from e
 
     async def _disconnect(self, error=None):
         if self._connection is None:
