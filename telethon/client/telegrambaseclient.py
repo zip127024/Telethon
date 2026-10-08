@@ -15,7 +15,7 @@ import warnings
 from .. import utils, version, helpers, errors, __name__ as __base_name__
 from ..crypto import rsa
 from ..extensions import markdown
-from ..network import MTProtoSender, Connection, ConnectionTcpFull, TcpMTProxy
+from ..network import MTProtoSender, Connection, ConnectionTcpFull, ConnectionTcpIntermediate, TcpMTProxy
 from ..sessions import Session, SQLiteSession, MemorySession
 from ..tl import functions, types
 from ..tl.alltlobjects import LAYER
@@ -31,6 +31,12 @@ DEFAULT_IPV4_IP = '149.154.167.51'
 DEFAULT_IPV6_IP = '2001:67c:4e8:f002::a'
 DEFAULT_PORT = 443
 
+# Telegram's test servers, which expect DC IDs + 10000 in the auth key handshake
+_TEST_DC_IPS = frozenset((
+    '149.154.175.10', '149.154.167.40', '149.154.175.117',
+    '2001:b28:f23d:f001::e', '2001:67c:4e8:f002::e', '2001:b28:f23d:f003::e',
+))
+
 if typing.TYPE_CHECKING:
     from .telegramclient import TelegramClient
 
@@ -43,6 +49,10 @@ _LAYER_RECOVERY_GRACE = 10
 
 # In seconds, how long to wait before disconnecting a exported sender.
 _DISCONNECT_EXPORTED_AFTER = 60
+
+# In seconds, how long connecting to a CDN DC (including the generation
+# of its auth key) may take before giving up.
+_CDN_CONNECT_TIMEOUT = 60
 
 
 class _ExportState:
@@ -417,9 +427,9 @@ class TelegramBaseClient(abc.ABC):
         self._flood_waited_requests = {}
 
         # Cache ``{dc_id: (_ExportState, MTProtoSender)}`` for all borrowed senders
+        # (CDN DCs have IDs of their own, so their senders are kept here too)
         self._borrowed_senders = {}
         self._borrow_sender_lock = asyncio.Lock()
-        self._exported_sessions = {}
 
         self._loop = None  # only used as a sanity check
         self._updates_error = None
@@ -674,9 +684,7 @@ class TelegramBaseClient(abc.ABC):
                 else:
                     self._mb_entity_cache.put(Entity(EntityType.CHANNEL, entity.channel_id, entity.access_hash))
 
-        self._init_request.query = functions.help.GetConfigRequest()
-
-        req = self._init_request
+        req = self._init_connection(functions.help.GetConfigRequest())
         if self._no_updates:
             req = functions.InvokeWithoutUpdatesRequest(req)
 
@@ -874,9 +882,7 @@ class TelegramBaseClient(abc.ABC):
         on ``sender`` like `connect` does, using a copy of ``_init_request``
         so that the device fingerprint and ``init_params`` stay the same.
         """
-        init = copy.copy(self._init_request)
-        init.query = functions.help.GetConfigRequest()
-        req = init
+        req = self._init_connection(functions.help.GetConfigRequest())
         if self._no_updates:
             req = functions.InvokeWithoutUpdatesRequest(req)
         await sender.send(functions.InvokeWithLayerRequest(LAYER, req))
@@ -959,15 +965,23 @@ class TelegramBaseClient(abc.ABC):
         if not cls._config:
             cls._config = await self(functions.help.GetConfigRequest())
 
-        if cdn and not self._cdn_config:
-            cls._cdn_config = await self(functions.help.GetCdnConfigRequest())
-            for pk in cls._cdn_config.public_keys:
-                if pk.dc_id == dc_id:
-                    rsa.add_key(pk.public_key, old=False)
+        if cdn:
+            await self._load_cdn_keys(dc_id)
 
+        dc = self._find_dc(dc_id, cdn)
+        if dc is None and cdn:
+            # A CDN DC may be newer than the cached configuration
+            cls._config = await self(functions.help.GetConfigRequest())
+            dc = self._find_dc(dc_id, cdn)
+        if dc is None:
+            raise ValueError(f'Failed to get DC {dc_id} (cdn = {cdn})')
+        return dc
+
+    def _find_dc(self: 'TelegramClient', dc_id, cdn):
+        options = self.__class__._config.dc_options
         try:
             return next(
-                dc for dc in cls._config.dc_options
+                dc for dc in options
                 if dc.id == dc_id
                 and bool(dc.ipv6) == self._use_ipv6 and bool(dc.cdn) == cdn
             )
@@ -976,13 +990,54 @@ class TelegramBaseClient(abc.ABC):
                 'Failed to get DC %s (cdn = %s) with use_ipv6 = %s; retrying ignoring IPv6 check',
                 dc_id, cdn, self._use_ipv6
             )
+            return next((dc for dc in options if dc.id == dc_id and bool(dc.cdn) == cdn), None)
+
+    async def _load_cdn_keys(self: 'TelegramClient', dc_id):
+        """
+        Registers the RSA keys of all CDN DCs, fetching them again
+        if there is none for `dc_id` (e.g. a new CDN DC).
+        """
+        cls = self.__class__
+        if cls._cdn_config and any(pk.dc_id == dc_id for pk in cls._cdn_config.public_keys):
+            return
+
+        cls._cdn_config = await self(functions.help.GetCdnConfigRequest())
+        for pk in cls._cdn_config.public_keys:
             try:
-                return next(
-                    dc for dc in cls._config.dc_options
-                    if dc.id == dc_id and bool(dc.cdn) == cdn
-                )
-            except StopIteration:
-                raise ValueError(f'Failed to get DC {dc_id} (cdn = {cdn})')
+                rsa.add_key(pk.public_key, old=False)
+            except Exception as e:
+                self._log[__name__].warning('Invalid RSA key of CDN DC %s: %s', pk.dc_id, e)
+
+    @staticmethod
+    def _cdn_auth_dc_id(dc_id, ip_address):
+        """
+        The ``dc`` of ``p_q_inner_data_dc`` to send when generating the auth
+        key of a CDN DC (see `authenticator.do_authentication`): its ID, plus
+        10000 on the test servers.
+        """
+        return dc_id + 10000 if ip_address in _TEST_DC_IPS else dc_id
+
+    def _init_connection(self: 'TelegramClient', query):
+        """
+        Returns :tl:`InitConnection` with the given query. The shared
+        ``_init_request`` is copied, never modified (other connections
+        may be using it at the same time).
+        """
+        init = copy.copy(self._init_request)
+        init.query = query
+        return init
+
+    def _connect_exported_sender(self: 'TelegramClient', sender, dc, connection=None, auth_dc_id=None):
+        # Regular DCs use the legacy auth scheme (auth_dc_id=None), which they
+        # require; only CDN DCs get p_q_inner_data_dc (see _connect_cdn_sender).
+        return sender.connect((connection or self._connection)(
+            dc.ip_address,
+            dc.port,
+            dc.id,
+            loggers=self._log,
+            proxy=self._proxy,
+            local_addr=self._local_addr
+        ), auth_dc_id=auth_dc_id)
 
     async def _create_exported_sender(self: 'TelegramClient', dc_id):
         """
@@ -997,26 +1052,84 @@ class TelegramBaseClient(abc.ABC):
         # If one were to do that, Telegram would reset the connection
         # with no further clues.
         sender = MTProtoSender(None, loggers=self._log)
-        await sender.connect(self._connection(
-            dc.ip_address,
-            dc.port,
-            dc.id,
-            loggers=self._log,
-            proxy=self._proxy,
-            local_addr=self._local_addr
-        ))
+        await self._connect_exported_sender(sender, dc)
         self._log[__name__].info('Exporting auth for new borrowed sender in %s', dc)
         auth = await self(functions.auth.ExportAuthorizationRequest(dc_id))
-        self._init_request.query = functions.auth.ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
-        req = functions.InvokeWithLayerRequest(LAYER, self._init_request)
+        req = functions.InvokeWithLayerRequest(LAYER, self._init_connection(
+            functions.auth.ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)))
         await sender.send(req)
         return sender
 
-    async def _borrow_exported_sender(self: 'TelegramClient', dc_id):
+    async def _create_cdn_sender(self: 'TelegramClient', dc_id):
+        """
+        Creates a new `MTProtoSender` for the given CDN `dc_id`. CDN DCs
+        need an auth key of their own and no authorization.
+        """
+        async def on_reconnect():
+            sender.needs_init = True
+
+        dc = await self._get_dc(dc_id, cdn=True)
+        sender = MTProtoSender(
+            None,
+            loggers=self._log,
+            retries=self._connection_retries,
+            delay=self._retry_delay,
+            connect_timeout=self._timeout,
+            auto_reconnect_callback=on_reconnect
+        )
+        sender.init_lock = asyncio.Lock()
+        await self._connect_cdn_sender(sender, dc)
+        return sender
+
+    async def _connect_cdn_sender(self: 'TelegramClient', sender, dc):
+        # CDN DCs don't answer the "full" TCP transport
+        connection = self._connection
+        if issubclass(connection, ConnectionTcpFull):
+            connection = ConnectionTcpIntermediate
+
+        self._log[__name__].info('Connecting to CDN %s', dc)
+        try:
+            await asyncio.wait_for(
+                self._connect_exported_sender(
+                    sender, dc, connection,
+                    auth_dc_id=self._cdn_auth_dc_id(dc.id, dc.ip_address)),
+                timeout=_CDN_CONNECT_TIMEOUT
+            )
+        except BaseException as e:
+            await sender.disconnect()
+            # The keys of the CDN DCs may have changed
+            self.__class__._cdn_config = None
+            if isinstance(e, asyncio.TimeoutError):
+                raise ConnectionError('Connecting to CDN DC {} timed out'.format(dc.id)) from e
+            raise
+
+        # The first request of the connection carries the device information
+        sender.needs_init = True
+
+    async def _call_cdn(self: 'TelegramClient', sender, request):
+        """
+        Invokes a request with a CDN sender. Its first request is wrapped in
+        :tl:`InvokeWithLayer` and :tl:`InitConnection` (CDN DCs only accept a
+        few methods, so these can't be sent alone) and runs before any other.
+        """
+        if sender.needs_init:
+            async with sender.init_lock:
+                if sender.needs_init:
+                    result = await self._call(sender, functions.InvokeWithLayerRequest(
+                        LAYER, self._init_connection(request)))
+                    sender.needs_init = False
+                    return result
+
+        return await self._call(sender, request)
+
+    async def _borrow_exported_sender(self: 'TelegramClient', dc_id, *, cdn=False):
         """
         Borrows a connected `MTProtoSender` for the given `dc_id`.
         If it's not cached, creates a new one if it doesn't exist yet,
         and imports a freshly exported authorization key for it to be usable.
+
+        With `cdn`, the sender is connected to a CDN DC instead, and
+        requests should be sent with `_call_cdn`.
 
         Once its job is over it should be `_return_exported_sender`.
         """
@@ -1026,20 +1139,19 @@ class TelegramBaseClient(abc.ABC):
 
             if state is None:
                 state = _ExportState()
-                sender = await self._create_exported_sender(dc_id)
+                if cdn:
+                    sender = await self._create_cdn_sender(dc_id)
+                else:
+                    sender = await self._create_exported_sender(dc_id)
                 sender.dc_id = dc_id
                 self._borrowed_senders[dc_id] = (state, sender)
 
-            elif state.need_connect():
-                dc = await self._get_dc(dc_id)
-                await sender.connect(self._connection(
-                    dc.ip_address,
-                    dc.port,
-                    dc.id,
-                    loggers=self._log,
-                    proxy=self._proxy,
-                    local_addr=self._local_addr
-                ))
+            elif state.need_connect() or not sender.is_connected():
+                # (the latter if it gave up reconnecting on its own)
+                if cdn:
+                    await self._connect_cdn_sender(sender, await self._get_dc(dc_id, cdn=True))
+                else:
+                    await self._connect_exported_sender(sender, await self._get_dc(dc_id))
 
             state.add_borrow()
             return sender
@@ -1051,8 +1163,10 @@ class TelegramBaseClient(abc.ABC):
         """
         async with self._borrow_sender_lock:
             self._log[__name__].debug('Returning borrowed sender for dc_id %d', sender.dc_id)
-            state, _ = self._borrowed_senders[sender.dc_id]
-            state.add_return()
+            state, borrowed = self._borrowed_senders.get(sender.dc_id, (None, None))
+            # (unless the client disconnected meanwhile, dropping all senders)
+            if borrowed is sender:
+                state.add_return()
 
     async def _clean_exported_senders(self: 'TelegramClient'):
         """
@@ -1067,34 +1181,6 @@ class TelegramBaseClient(abc.ABC):
                     # Disconnect should never raise
                     await sender.disconnect()
                     state.mark_disconnected()
-
-    async def _get_cdn_client(self: 'TelegramClient', cdn_redirect):
-        """Similar to ._borrow_exported_client, but for CDNs"""
-        session = self._exported_sessions.get(cdn_redirect.dc_id)
-        if not session:
-            dc = await self._get_dc(cdn_redirect.dc_id, cdn=True)
-            session = await utils.maybe_async(self.session.clone())
-            await utils.maybe_async(session.set_dc(dc.id, dc.ip_address, dc.port))
-            self._exported_sessions[cdn_redirect.dc_id] = session
-
-        self._log[__name__].info('Creating new CDN client')
-        client = self.__class__(
-            session, self.api_id, self.api_hash,
-            proxy=self._proxy,
-            timeout=self._timeout,
-            loop=self.loop
-        )
-
-        session.auth_key = self._sender.auth_key
-        await client._sender.connect(self._connection(
-            session.server_address,
-            session.port,
-            session.dc_id,
-            loggers=self._log,
-            proxy=self._proxy,
-            local_addr=self._local_addr
-        ))
-        return client
 
     # endregion
 

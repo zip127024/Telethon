@@ -3,7 +3,7 @@ This module holds several utilities regarding RSA and server fingerprints.
 """
 import os
 import struct
-from hashlib import sha1
+from hashlib import sha1, sha256
 try:
     import rsa
     import rsa.core
@@ -11,6 +11,7 @@ except ImportError:
     rsa = None
     raise ImportError('Missing module "rsa", please install via pip.')
 
+from .aes import AES
 from ..tl import TLObject
 
 
@@ -80,6 +81,41 @@ def encrypt(fingerprint, data, *, use_old=False):
     # rsa module uses transform.int2bytes(encrypted, keylength), easier:
     block = encrypted.to_bytes(256, 'big')
     return block
+
+
+def encrypt_pad(fingerprint, data, *, use_old=False):
+    """
+    Encrypts the given data known the fingerprint to be used with the
+    RSA_PAD scheme (https://core.telegram.org/mtproto/auth_key), the one
+    official clients use and the only one CDN data centers accept.
+
+    :param fingerprint: the fingerprint of the RSA key.
+    :param data: the data to be encrypted (at most 144 bytes).
+    :param use_old: whether old keys should be used.
+    :return:
+        the cipher text, or None if no key matching this fingerprint is found.
+    """
+    key, old = _server_keys.get(fingerprint, [None, None])
+    if (not key) or (old and not use_old):
+        return None
+
+    if len(data) > 144:
+        raise ValueError('RSA_PAD data must be at most 144 bytes, got {}'.format(len(data)))
+
+    data_with_padding = data + os.urandom(192 - len(data))
+    data_pad_reversed = data_with_padding[::-1]
+    while True:
+        temp_key = os.urandom(32)
+        data_with_hash = data_pad_reversed + sha256(temp_key + data_with_padding).digest()
+        aes_encrypted = AES.encrypt_ige(data_with_hash, temp_key, bytes(32))
+        temp_key_xor = bytes(a ^ b for a, b in zip(temp_key, sha256(aes_encrypted).digest()))
+        payload = int.from_bytes(temp_key_xor + aes_encrypted, 'big')
+        # The 256-byte value must be smaller than the modulus to be encrypted
+        if payload < key.n:
+            break
+
+    encrypted = rsa.core.encrypt_int(payload, key.e, key.n)
+    return encrypted.to_bytes(256, 'big')
 
 
 # Add default keys

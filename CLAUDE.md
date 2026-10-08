@@ -42,6 +42,54 @@ Telegram хранит слой API **на auth key**: соединение, по
 * Лимит: `layer_recovery_limit` (по умолчанию 3, `0` — выключить) за `layer_recovery_window` секунд (600). Дальше — `errors.LayerConflictError` (подкласс `TypeNotFoundError`, старые `except` продолжают работать; `_update_loop` на нём, как и раньше, отключает клиент при getDifference).
 * Push-апдейты: `MTProtoSender._recv_loop` раньше молча выбрасывал нечитаемые апдейты (бот «слеп» до getDifference, до 30 мин). Теперь sender вызывает `type_not_found_callback`, клиент переинициализирует слой в фоне (debounce 10 с, тот же лимит).
 * Тесты: `tests/telethon/client/test_layer_recovery.py`.
+### Поддержка CDN (скачивание файлов через CDN дата-центры)
+
+Telegram отвечает на `upload.getFile` редиректом `upload.fileCdnRedirect` для
+официальных `api_id` (напр. Android `api_id` 4) **даже без флага `cdn_supported`**,
+поэтому поддержка CDN обязательна для таких аккаунтов. Реализация (`telethon/crypto/cdndecrypter.py`,
+CDN-ветка в `telethon/client/downloads.py`, CDN-отправители в `telegrambaseclient.py`):
+
+- **Отдельный auth key на CDN DC** через DH (без login/authorization), транспорт
+  `ConnectionTcpIntermediate` (CDN DC не отвечают на `ConnectionTcpFull` — зависает),
+  первый запрос — `invokeWithLayer(initConnection(...))` с отпечатком аккаунта.
+- RSA-ключи **всех** CDN DC регистрируются из `help.getCdnConfig` (`_load_cdn_keys`),
+  конфиг перезапрашивается, если ключа для нужного DC нет.
+- Расшифровка части — **AES-256-CTR**, key = `encryption_key`, IV = `encryption_iv`
+  с последними 4 байтами = big-endian `offset / 16`. Используется `cryptography`,
+  фолбэк на `pyaes`; чистый Python гоняется в `run_in_executor` (не блокирует loop).
+- Каждая часть проверяется по SHA-256 (`file_hashes` редиректа + `upload.getCdnFileHashes`
+  на DC файла). `CdnFileReuploadNeeded` → `upload.reuploadCdnFile` на DC файла в цикле.
+  Протухший токен (`FILE_TOKEN_INVALID` / `CDN_*`) → повторный `upload.getFile` с текущего
+  offset (`iter_download` следует за редиректом прозрачно, без приватного исключения).
+
+### CDN: p_q_inner_data_dc — ТОЛЬКО для CDN DC, обычные DC его отвергают
+
+Ключевой факт, проверенный вживую (анонимный handshake, 2026-10): обычные
+(не-CDN) дата-центры **отвергают** `p_q_inner_data_dc` + RSA_PAD транспортной
+ошибкой −404 на `req_DH_params`; они принимают только **легаси** `p_q_inner_data`
+(`sha1(data)+data+padding`). CDN DC — наоборот: только `p_q_inner_data_dc` + RSA_PAD.
+
+Поэтому схема выбирается **по типу DC**, а не глобально: `MTProtoSender.connect(...,
+auth_dc_id=...)` → `authenticator.do_authentication(sender, dc_id)`. `dc_id=None`
+(по умолчанию) = легаси для всех обычных DC; `dc_id` задаётся (`_cdn_auth_dc_id`,
+на тестовых серверах +10000) только для CDN-отправителей. Утверждение «официальные
+клиенты шлют `p_q_inner_data_dc` везде» на живых DC не подтвердилось — **не менять
+схему обычных DC на `p_q_inner_data_dc`**, иначе каждый коннект к основному DC будет
+падать и переподключаться.
+
+### CDN: имя RPC-ошибки берётся из класса, а не из .message
+
+Именованные классы ошибок Telethon хранят базовое `message` (`CdnMethodInvalidError().message
+== 'BAD_REQUEST'`, а не `'CDN_METHOD_INVALID'`). В `downloads._rpc_error_name` имя
+восстанавливается из класса через `rpcerrorlist`; проверять `error.message` на `CDN_*`
+нельзя — пропустит именованные ошибки.
+
+### MAX_CHUNK_SIZE = 1 MiB
+
+В `downloads.py` поднят с 512 KiB до 1 MiB (как в 64Gram/tdesktop). `upload.getFile`
+принимает до 1 MiB при offset, кратном размеру части (часть не должна пересекать границу
+1 MiB — отсюда `offset % request_size == 0` для прямого итератора). Обновление
+file-reference работает и для фото (`InputPhotoFileLocation`), и для документов.
 
 ## Критические знания (не удалять)
 

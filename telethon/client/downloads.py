@@ -6,7 +6,7 @@ import typing
 import inspect
 import asyncio
 
-from ..crypto import AES
+from ..crypto import AES, CdnDecrypter
 
 from .. import utils, helpers, errors, hints
 from ..requestiter import RequestIter
@@ -20,38 +20,207 @@ except ImportError:
 if typing.TYPE_CHECKING:
     from .telegramclient import TelegramClient
 
-# Chunk sizes for upload.getFile must be multiples of the smallest size
+# Chunk sizes for upload.getFile must be multiples of the smallest size.
+# Up to 1 MB may be requested, as long as a part doesn't cross a 1 MB boundary.
 MIN_CHUNK_SIZE = 4096
-MAX_CHUNK_SIZE = 512 * 1024
+MAX_CHUNK_SIZE = 1024 * 1024
 
 # 2021-01-15, users reported that `errors.TimeoutError` can occur while downloading files.
 TIMED_OUT_SLEEP = 1
 
+# How many times in a row a download from a CDN may fail (expired file token,
+# hash mismatch, unreachable CDN DC...) and be resumed through the file's DC.
+MAX_CDN_RESTARTS = 5
 
-class _CdnRedirect(Exception):
-    def __init__(self, cdn_redirect=None):
-        self.cdn_redirect = cdn_redirect
+# How many times in a row a CDN DC may ask to reupload the file to it
+MAX_CDN_REUPLOADS = 3
+
+
+def _cdn_limit(offset, size):
+    """
+    How many bytes to request at ``offset`` (a multiple of 4 KB) to get
+    ``size`` bytes, the same way as with upload.getFile: a power of two
+    between 4 KB and 1 MB which ``offset`` is a multiple of.
+    """
+    limit = MIN_CHUNK_SIZE
+    while limit < size and limit < MAX_CHUNK_SIZE and offset % (limit * 2) == 0:
+        limit *= 2
+    return limit
+
+
+def _rpc_error_name(error):
+    """
+    The TL error string (``'FILE_TOKEN_INVALID'``) of a Telethon RPC error.
+
+    Telethon's *named* error classes keep the base-class ``message``
+    (``CdnMethodInvalidError().message == 'BAD_REQUEST'``), so the name is
+    recovered from the class via the generated error list; unmapped errors
+    keep the TL string in ``message``.
+    """
+    name = _RPC_ERROR_NAMES.get(type(error))
+    return name or str(getattr(error, 'message', '') or '')
+
+
+_RPC_ERROR_NAMES = {}
+
+
+def _build_rpc_error_names():
+    from ..errors import rpcerrorlist
+    for name, cls in rpcerrorlist.rpc_errors_dict.items():
+        _RPC_ERROR_NAMES.setdefault(cls, name)
+    for regex, cls in rpcerrorlist.rpc_errors_re:
+        # 'FILE_MIGRATE_(\\d+)' -> 'FILE_MIGRATE'
+        _RPC_ERROR_NAMES.setdefault(cls, regex.split('_(')[0].strip('^'))
+
+
+_build_rpc_error_names()
+
+
+def _is_cdn_failure(error):
+    """
+    Whether a download from a CDN should be resumed through the file's DC
+    (which may redirect it to a CDN again) after the given error.
+
+    These are: a part that failed its hash check, the CDN connection going
+    down, and the redirect/token becoming unusable (``FILE_TOKEN_INVALID`` or
+    any ``CDN_*`` error, e.g. the file DC was slow to reupload to the CDN).
+    """
+    if isinstance(error, (errors.CdnFileTamperedError, ConnectionError)):
+        return True
+    return isinstance(error, errors.RPCError) \
+        and _rpc_error_name(error).startswith(('FILE_TOKEN_INVALID', 'CDN_'))
+
+
+class _CdnDownload:
+    """
+    Downloads the parts of a file that Telegram redirected to a CDN DC
+    (:tl:`upload.FileCdnRedirect`). https://core.telegram.org/cdn
+
+    The parts are decrypted and checked against the hashes of the file's DC
+    before being returned, so whole hashed ranges are requested from the CDN
+    (the bytes not read yet are kept for the next call).
+    """
+    def __init__(self, client, redirect, call_file_dc):
+        """
+        :param client: the `TelegramClient`.
+        :param redirect: the :tl:`upload.FileCdnRedirect`.
+        :param call_file_dc: coroutine function sending a request to the file's DC.
+        """
+        self._client = client
+        self._redirect = redirect
+        self._call_file_dc = call_file_dc
+        self._decrypter = CdnDecrypter(
+            redirect.encryption_key, redirect.encryption_iv, redirect.file_hashes)
+        self._sender = None
+        self._buffer_offset = 0
+        self._buffer = b''
+        self._eof = None  # size of the file, once known
+
+    async def read(self, offset, limit):
+        """
+        Returns the bytes ``[offset, offset + limit)`` of the file,
+        or less if its end is reached.
+        """
+        end = offset + limit
+        parts = []
+        while offset < end:
+            if self._buffer_offset <= offset < self._buffer_offset + len(self._buffer):
+                part = self._buffer[offset - self._buffer_offset:end - self._buffer_offset]
+                parts.append(part)
+                offset += len(part)
+            elif self._eof is not None and offset >= self._eof:
+                break
+            else:
+                await self._fetch(offset, end)
+
+        return b''.join(parts)
+
+    async def _fetch(self, offset, end):
+        """Fills the buffer with the verified hashed ranges from ``offset``."""
+        file_hash = await self._get_hash(offset)
+        if file_hash is None:
+            # There's no range after the last one: it must be the end of the file
+            if await self._get_cdn_file(offset - offset % MIN_CHUNK_SIZE, MIN_CHUNK_SIZE):
+                raise errors.CdnFileTamperedError()
+            self._eof = offset
+            return
+
+        start = file_hash.offset
+        limit = _cdn_limit(start, max(end, start + file_hash.limit) - start)
+        data = await self._get_cdn_file(start, limit)
+        eof = len(data) < limit
+
+        position = start
+        while position < start + len(data):
+            file_hash = await self._get_hash(position)
+            if file_hash is None or file_hash.offset != position:
+                raise errors.CdnFileTamperedError()
+            position += file_hash.limit
+
+        if self._decrypter.slow:
+            data = await helpers.get_running_loop().run_in_executor(
+                None, self._decrypter.decrypt, start, data)
+        else:
+            data = self._decrypter.decrypt(start, data)
+
+        verified = self._decrypter.verify(start, data, eof)
+        if not verified and not eof:
+            raise errors.CdnFileTamperedError()  # a range too long to request
+
+        self._buffer_offset = start
+        self._buffer = data[:verified]
+        if eof:
+            self._eof = start + verified
+
+    async def _get_hash(self, offset):
+        file_hash = self._decrypter.get_hash(offset)
+        if file_hash is None:
+            self._decrypter.add_hashes(await self._call_file_dc(
+                functions.upload.GetCdnFileHashesRequest(self._redirect.file_token, offset)))
+            file_hash = self._decrypter.get_hash(offset)
+        return file_hash
+
+    async def _get_cdn_file(self, offset, limit):
+        request = functions.upload.GetCdnFileRequest(self._redirect.file_token, offset, limit)
+        for _ in range(MAX_CDN_REUPLOADS + 1):
+            if self._sender is None:
+                self._sender = await self._client._borrow_exported_sender(
+                    self._redirect.dc_id, cdn=True)
+
+            result = await self._client._call_cdn(self._sender, request)
+            if not isinstance(result, types.upload.CdnFileReuploadNeeded):
+                return result.bytes
+
+            # The CDN doesn't have this part (anymore), the file's DC sends it again
+            self._client._log[__name__].info(
+                'CDN DC %d asks to reupload the file', self._redirect.dc_id)
+            self._decrypter.add_hashes(await self._call_file_dc(
+                functions.upload.ReuploadCdnFileRequest(
+                    self._redirect.file_token, result.request_token)))
+
+        raise ConnectionError('CDN DC {} still asks to reupload the file'.format(self._redirect.dc_id))
+
+    async def close(self):
+        sender, self._sender = self._sender, None
+        if sender is not None:
+            await self._client._return_exported_sender(sender)
 
 
 class _DirectDownloadIter(RequestIter):
     async def _init(
-            self, file, dc_id, offset, stride, chunk_size, request_size, file_size, msg_data, cdn_redirect=None):
+            self, file, dc_id, offset, stride, chunk_size, request_size, file_size, msg_data):
         self.request = functions.upload.GetFileRequest(
             file, offset=offset, limit=request_size)
-        self._client = self.client
-        self._cdn_redirect = cdn_redirect
-        if cdn_redirect is not None:
-          self.request = functions.upload.GetCdnFileRequest(cdn_redirect.file_token, offset=offset, limit=request_size)
-          self._client = await self.client._get_cdn_client(cdn_redirect)
-
         self.total = file_size
         self._stride = stride
         self._chunk_size = chunk_size
         self._last_part = None
         self._msg_data = msg_data
         self._timed_out = False
+        self._cdn = None
+        self._cdn_restarts = 0
 
-        self._exported = dc_id and self._client.session.dc_id != dc_id
+        self._exported = dc_id and self.client.session.dc_id != dc_id
         if not self._exported:
             # The used sender will also change if ``FileMigrateError`` occurs
             self._sender = self.client._sender
@@ -84,20 +253,38 @@ class _DirectDownloadIter(RequestIter):
         else:
             self.request.offset += self._stride
 
+    def _call_file_dc(self, request):
+        return self.client._call(self._sender, request)
+
     async def _request(self):
         try:
-            result = await self._client._call(self._sender, self.request)
+            if self._cdn:
+                try:
+                    result = await self._cdn.read(self.request.offset, self.request.limit)
+                    self._cdn_restarts = 0
+                    return result
+                except Exception as e:
+                    if not _is_cdn_failure(e) or self._cdn_restarts >= MAX_CDN_RESTARTS:
+                        raise
+
+                    self._cdn_restarts += 1
+                    self.client._log[__name__].info(
+                        'Download from CDN failed (%s: %s); asking the file DC again',
+                        type(e).__name__, e)
+                    cdn, self._cdn = self._cdn, None
+                    await cdn.close()
+
+            result = await self.client._call(self._sender, self.request)
             self._timed_out = False
             if isinstance(result, types.upload.FileCdnRedirect):
                 if self.client._mb_entity_cache.self_bot:
                     raise ValueError('FileCdnRedirect but the GetCdnFileRequest API access for bot users is restricted. Try to change api_id to avoid FileCdnRedirect')
-                raise _CdnRedirect(result)
-            if isinstance(result, types.upload.CdnFileReuploadNeeded):
-                await self.client._call(self.client._sender, functions.upload.ReuploadCdnFileRequest(file_token=self._cdn_redirect.file_token, request_token=result.request_token))
-                result = await self._client._call(self._sender, self.request)
-                return result.bytes
-            else:
-                return result.bytes
+
+                self.client._log[__name__].info('File is served by CDN DC %d', result.dc_id)
+                self._cdn = _CdnDownload(self.client, result, self._call_file_dc)
+                return await self._request()
+
+            return result.bytes
 
         except errors.TimedOutError as e:
             if self._timed_out:
@@ -116,39 +303,50 @@ class _DirectDownloadIter(RequestIter):
             return await self._request()
 
         except (errors.FilerefUpgradeNeededError, errors.FileReferenceExpiredError) as e:
-            # Only implemented for documents which are the ones that may take that long to download
-            if not self._msg_data \
-                    or not isinstance(self.request.location, types.InputDocumentFileLocation) \
-                    or self.request.location.thumb_size != '':
+            # Large files may take long enough to download to need a new
+            # file reference, which the message they belong to has.
+            location = self.request.location
+            if not self._msg_data or not isinstance(
+                    location, (types.InputDocumentFileLocation, types.InputPhotoFileLocation)):
                 raise
 
             self.client._log[__name__].info('File ref expired during download; refetching message')
             chat, msg_id = self._msg_data
             msg = await self.client.get_messages(chat, ids=msg_id)
 
-            if not isinstance(msg.media, types.MessageMediaDocument):
-                raise
-
-            document = msg.media.document
+            media = msg.media if msg else None
+            if isinstance(media, types.MessageMediaWebPage) and isinstance(media.webpage, types.WebPage):
+                media = media.webpage.document or media.webpage.photo
+            elif isinstance(media, types.MessageMediaDocument):
+                media = media.document
+            elif isinstance(media, types.MessageMediaPhoto):
+                media = media.photo
 
             # Message media may have been edited for something else
-            if document.id != self.request.location.id:
+            if isinstance(location, types.InputDocumentFileLocation):
+                expected = types.Document
+            else:
+                expected = types.Photo
+            if not isinstance(media, expected) or media.id != location.id \
+                    or media.file_reference == location.file_reference:
                 raise
 
-            self.request.location.file_reference = document.file_reference
+            location.file_reference = media.file_reference
             return await self._request()
 
     async def close(self):
-        if not self._sender:
+        cdn, self._cdn = getattr(self, '_cdn', None), None
+        if cdn:
+            await cdn.close()
+
+        sender, self._sender = getattr(self, '_sender', None), None
+        if not sender:
             return
 
-        try:
-            if self._exported:
-                await self.client._return_exported_sender(self._sender)
-            elif self._sender != self.client._sender:
-                await self._sender.disconnect()
-        finally:
-            self._sender = None
+        if self._exported:
+            await self.client._return_exported_sender(sender)
+        elif sender != self.client._sender:
+            await sender.disconnect()
 
     async def __aenter__(self):
         return self
@@ -435,7 +633,7 @@ class DownloadMethods:
 
         if isinstance(media, (types.MessageMediaPhoto, types.Photo)):
             return await self._download_photo(
-                media, file, date, thumb, progress_callback
+                media, file, date, thumb, progress_callback, msg_data
             )
         elif isinstance(media, (types.MessageMediaDocument, types.Document)):
             return await self._download_document(
@@ -484,7 +682,7 @@ class DownloadMethods:
 
             part_size_kb (`int`, optional):
                 Chunk size when downloading files. The larger, the less
-                requests will be made (up to 512KB maximum).
+                requests will be made (up to 1024KB maximum).
 
             file_size (`int`, optional):
                 The file size that is about to be downloaded, if known.
@@ -535,8 +733,7 @@ class DownloadMethods:
             dc_id: int = None,
             key: bytes = None,
             iv: bytes = None,
-            msg_data: tuple = None,
-            cdn_redirect: types.upload.FileCdnRedirect = None
+            msg_data: tuple = None
     ) -> typing.Optional[bytes]:
         if not part_size_kb:
             if not file_size:
@@ -563,18 +760,20 @@ class DownloadMethods:
             f = file
 
         try:
-            async for chunk in self._iter_download(
-                    input_location, request_size=part_size, dc_id=dc_id, msg_data=msg_data, cdn_redirect=cdn_redirect):
-                if iv and key:
-                    chunk = AES.decrypt_ige(chunk, key, iv)
-                r = f.write(chunk)
-                if inspect.isawaitable(r):
-                    await r
-
-                if progress_callback:
-                    r = progress_callback(f.tell(), file_size)
+            # Closing the iterator returns the senders it borrowed, even on error
+            async with self._iter_download(
+                    input_location, request_size=part_size, dc_id=dc_id, msg_data=msg_data) as chunks:
+                async for chunk in chunks:
+                    if iv and key:
+                        chunk = AES.decrypt_ige(chunk, key, iv)
+                    r = f.write(chunk)
                     if inspect.isawaitable(r):
                         await r
+
+                    if progress_callback:
+                        r = progress_callback(f.tell(), file_size)
+                        if inspect.isawaitable(r):
+                            await r
 
             # Not all IO objects have flush (see #1227)
             if callable(getattr(f, 'flush', None)):
@@ -582,20 +781,6 @@ class DownloadMethods:
 
             if in_memory:
                 return f.getvalue()
-        except _CdnRedirect as e:
-          self._log[__name__].info('FileCdnRedirect to CDN data center %s', e.cdn_redirect.dc_id)
-          return await self._download_file(
-              input_location=input_location,
-              file=file,
-              part_size_kb=part_size_kb,
-              file_size=file_size,
-              progress_callback=progress_callback,
-              dc_id=e.cdn_redirect.dc_id,
-              key=e.cdn_redirect.encryption_key,
-              iv=e.cdn_redirect.encryption_iv,
-              msg_data=msg_data,
-              cdn_redirect=e.cdn_redirect
-          )
         finally:
             if isinstance(file, str) or in_memory:
                 f.close()
@@ -717,8 +902,7 @@ class DownloadMethods:
             request_size: int = MAX_CHUNK_SIZE,
             file_size: int = None,
             dc_id: int = None,
-            msg_data: tuple = None,
-            cdn_redirect: types.upload.FileCdnRedirect = None
+            msg_data: tuple = None
     ):
         info = utils._get_file_info(file)
         if info.dc_id is not None:
@@ -746,8 +930,10 @@ class DownloadMethods:
         elif request_size > MAX_CHUNK_SIZE:
             request_size = MAX_CHUNK_SIZE
 
+        # Parts must not cross a 1 MB boundary, so the direct
+        # download needs an offset that is a multiple of their size
         if chunk_size == request_size \
-                and offset % MIN_CHUNK_SIZE == 0 \
+                and offset % request_size == 0 \
                 and stride % MIN_CHUNK_SIZE == 0 \
                 and (limit is None or offset % limit == 0):
             cls = _DirectDownloadIter
@@ -768,8 +954,7 @@ class DownloadMethods:
             chunk_size=chunk_size,
             request_size=request_size,
             file_size=file_size,
-            msg_data=msg_data,
-            cdn_redirect=cdn_redirect
+            msg_data=msg_data
         )
 
     # endregion
@@ -842,7 +1027,7 @@ class DownloadMethods:
                 f.close()
         return file
 
-    async def _download_photo(self: 'TelegramClient', photo, file, date, thumb, progress_callback):
+    async def _download_photo(self: 'TelegramClient', photo, file, date, thumb, progress_callback, msg_data=None):
         """Specialized version of .download_media() for photos"""
         # Determine the photo and its largest size
         if isinstance(photo, types.MessageMediaPhoto):
@@ -868,7 +1053,7 @@ class DownloadMethods:
         else:
             file_size = size.size
 
-        result = await self.download_file(
+        result = await self._download_file(
             types.InputPhotoFileLocation(
                 id=photo.id,
                 access_hash=photo.access_hash,
@@ -877,7 +1062,8 @@ class DownloadMethods:
             ),
             file,
             file_size=file_size,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            msg_data=msg_data,
         )
         return result if file is bytes else file
 
