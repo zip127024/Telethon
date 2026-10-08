@@ -944,7 +944,7 @@ class ChatMethods:
                 # TODO get rid of this once sessions cache this information
                 if entity.channel_id not in self._megagroup_cache:
                     full_entity = await self.get_entity(entity)
-                    self._megagroup_cache[entity.channel_id] = full_entity.megagroup
+                    self._megagroup_cache[entity.channel_id] = getattr(full_entity, 'megagroup', False)
 
                 if self._megagroup_cache[entity.channel_id]:
                     post_messages = None
@@ -1226,7 +1226,7 @@ class ChatMethods:
         entity = await self.get_entity(entity)
 
         if not user:
-            if isinstance(entity, types.Channel):
+            if isinstance(entity, (types.Channel, types.Community)):
                 FullChat = await self(functions.channels.GetFullChannelRequest(entity))
             elif isinstance(entity, types.Chat):
                 FullChat = await self(functions.messages.GetFullChatRequest(entity.id))

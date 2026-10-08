@@ -78,6 +78,16 @@ Do you like how Telethon looks? Check out `Read The Docs`_ for a more
 in-depth explanation, with examples, troubleshooting issues, and more
 useful information.
 
+
+Contributing
+------------
+
+Telethon v1 is for the most part in maintenance mode.
+New layers are still updated to when released, bug fixes are welcome,
+and some small additions may still be added from time to time.
+
+**Please only submit issues and pull requests authored entirely by you or other fellow humans.**
+
 .. _asyncio: https://docs.python.org/3/library/asyncio.html
 .. _MTProto: https://core.telegram.org/mtproto
 .. _Telegram: https://telegram.org

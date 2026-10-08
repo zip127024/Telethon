@@ -62,8 +62,8 @@ class SQLiteSession(MemorySession):
             c.execute('select * from sessions')
             tuple_ = c.fetchone()
             if tuple_:
-                self._dc_id, self._server_address, self._port, key, tmp_key, \
-                    self._takeout_id = tuple_
+                self._dc_id, self._server_address, self._port, key, self._takeout_id, \
+                    tmp_key = tuple_
                 self._auth_key = AuthKey(data=key)
                 self._tmp_auth_key = AuthKey(data=tmp_key)
 

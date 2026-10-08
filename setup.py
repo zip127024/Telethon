@@ -200,7 +200,7 @@ def main(argv):
             shutil.rmtree(x, ignore_errors=True)
 
     else:
-        # e.g. install from GitHub
+        # e.g. install from Codeberg
         if GENERATOR_DIR.is_dir():
             generate(['tl', 'errors'])
 
@@ -217,8 +217,8 @@ def main(argv):
             description="Full-featured Telegram client library for Python 3",
             long_description=long_description,
 
-            url='https://github.com/LonamiWebs/Telethon',
-            download_url='https://github.com/LonamiWebs/Telethon/releases',
+            url='https://codeberg.org/Lonami/Telethon',
+            download_url='https://codeberg.org/Lonami/Telethon/tags',
 
             author='Lonami Exo',
             author_email='totufals@hotmail.com',
@@ -239,8 +239,6 @@ def main(argv):
 
                 'Intended Audience :: Developers',
                 'Topic :: Communications :: Chat',
-
-                'License :: OSI Approved :: MIT License',
 
                 'Programming Language :: Python :: 3',
                 'Programming Language :: Python :: 3.5',

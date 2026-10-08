@@ -425,10 +425,12 @@ class _FileStream(io.IOBase):
 # endregion
 
 def get_running_loop():
-    if sys.version_info >= (3, 7):
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
         try:
-            return asyncio.get_running_loop()
+            return asyncio.get_event_loop()
         except RuntimeError:
-            return asyncio.get_event_loop_policy().get_event_loop()
-    else:
-        return asyncio.get_event_loop()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop

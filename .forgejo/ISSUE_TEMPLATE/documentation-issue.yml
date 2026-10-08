@@ -7,7 +7,7 @@ body:
     id: description
     attributes:
       label: Description
-      description: Describe the problem in detail.
+      description: Describe the problem in detail with your own words. **Do not use AI.**
       placeholder: This part is unclear...
 
   - type: checkboxes

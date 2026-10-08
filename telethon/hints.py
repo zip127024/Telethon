@@ -7,8 +7,8 @@ from .tl import types, custom
 Phone = str
 Username = str
 PeerID = int
-Entity = typing.Union[types.User, types.Chat, types.Channel]
-FullEntity = typing.Union[types.UserFull, types.messages.ChatFull, types.ChatFull, types.ChannelFull]
+Entity = typing.Union[types.User, types.Chat, types.Channel, types.Community]
+FullEntity = typing.Union[types.UserFull, types.messages.ChatFull, types.ChatFull, types.ChannelFull, types.CommunityFull]
 
 EntityLike = typing.Union[
     Phone,

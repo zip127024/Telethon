@@ -125,7 +125,7 @@ class UploadMethods:
             attributes: 'typing.Sequence[types.TypeDocumentAttribute]' = None,
             thumb: 'hints.FileLike' = None,
             allow_cache: bool = True,
-            parse_mode: str = (),
+            parse_mode: typing.Optional[str] = (),
             formatting_entities: typing.Optional[
                 typing.Union[
                     typing.List[types.TypeMessageEntity], typing.List[typing.List[types.TypeMessageEntity]]
@@ -276,7 +276,7 @@ class UploadMethods:
                 If `True` the video will be sent as a video note,
                 also known as a round video message.
 
-            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`):
+            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`, :tl:`KeyboardInlineButton`):
                 The matrix (list of lists), row list or button to be shown
                 after sending the message. This parameter will only work if
                 you have signed in as a bot. You can also pass your own

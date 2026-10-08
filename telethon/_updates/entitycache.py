@@ -1,4 +1,5 @@
 from .session import EntityType, Entity
+from ..tl import types
 
 
 _sentinel = object()
@@ -41,8 +42,10 @@ class EntityCache:
         self.hash_map.update(
             (c.id, (
                 c.access_hash,
-                EntityType.MEGAGROUP if c.megagroup else (
-                    EntityType.GIGAGROUP if getattr(c, 'gigagroup', None) else EntityType.CHANNEL
+                EntityType.COMMUNITY if isinstance(c, types.Community) else (
+                    EntityType.MEGAGROUP if getattr(c, 'megagroup', None) else (
+                        EntityType.GIGAGROUP if getattr(c, 'gigagroup', None) else EntityType.CHANNEL
+                    )
                 ),
             ))
             for c in chats

@@ -718,7 +718,7 @@ class MessageMethods:
             clear_draft (`bool`, optional):
                 Whether the existing draft should be cleared or not.
 
-            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`):
+            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`, :tl:`KeyboardInlineButton`):
                 The matrix (list of lists), row list or button to be shown
                 after sending the message. This parameter will only work if
                 you have signed in as a bot. You can also pass your own
@@ -1088,7 +1088,7 @@ class MessageMethods:
             message: 'typing.Union[int, types.Message, types.InputMessageID, str]' = None,
             text: str = None,
             *,
-            parse_mode: str = (),
+            parse_mode: typing.Optional[str] = (),
             attributes: 'typing.Sequence[types.TypeDocumentAttribute]' = None,
             formatting_entities: typing.Optional[typing.List[types.TypeMessageEntity]] = None,
             link_preview: bool = True,
@@ -1160,7 +1160,7 @@ class MessageMethods:
             force_document (`bool`, optional):
                 Whether to send the given file as a document or not.
 
-            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`):
+            buttons (`list`, `custom.Button <telethon.tl.custom.button.Button>`, :tl:`KeyboardButton`, :tl:`KeyboardInlineButton`):
                 The matrix (list of lists), row list or button to be shown
                 after sending the message. This parameter will only work if
                 you have signed in as a bot. You can also pass your own
