@@ -62,6 +62,10 @@ CDN-ветка в `telethon/client/downloads.py`, CDN-отправители в 
   Протухший токен (`FILE_TOKEN_INVALID` / `CDN_*`) → повторный `upload.getFile` с текущего
   offset (`iter_download` следует за редиректом прозрачно, без приватного исключения).
 
+### CDN: класс `_CdnRedirect` оставлен для совместимости
+
+Раньше `iter_download` бросал приватный `downloads._CdnRedirect`, и tg-json-downloader качал CDN-файлы своим `tgdl/export/cdn.py`. Теперь форк следует редиректу сам и класс не бросает, но он оставлен (пустой), т.к. tgdl его импортирует (`tgdl/export/files.py`, тестовые фейки). Следствие: в бою tgdl качает CDN-файлы через реализацию форка, его собственный `cdn.py` не вызывается.
+
 ### CDN: p_q_inner_data_dc — ТОЛЬКО для CDN DC, обычные DC его отвергают
 
 Ключевой факт, проверенный вживую (анонимный handshake, 2026-10): обычные

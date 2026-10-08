@@ -36,6 +36,16 @@ MAX_CDN_RESTARTS = 5
 MAX_CDN_REUPLOADS = 3
 
 
+class _CdnRedirect(Exception):
+    """
+    Fork: no longer raised (iter_download now follows CDN redirects itself).
+    Kept because downstream code imports it, e.g. tg-json-downloader's
+    ``tgdl/export/files.py`` and its test fakes.
+    """
+    def __init__(self, cdn_redirect=None):
+        self.cdn_redirect = cdn_redirect
+
+
 def _cdn_limit(offset, size):
     """
     How many bytes to request at ``offset`` (a multiple of 4 KB) to get
