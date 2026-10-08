@@ -51,7 +51,8 @@ class MTProtoSender:
     def __init__(self, auth_key, *, loggers,
                  retries=5, delay=1, auto_reconnect=True, connect_timeout=None,
                  auth_key_callback=None,
-                 updates_queue=None, auto_reconnect_callback=None):
+                 updates_queue=None, auto_reconnect_callback=None,
+                 type_not_found_callback=None):
         self._connection = None
         self._loggers = loggers
         self._log = loggers[__name__]
@@ -61,6 +62,7 @@ class MTProtoSender:
         self._connect_timeout = connect_timeout
         self._auth_key_callback = auth_key_callback
         self._updates_queue = updates_queue
+        self._type_not_found_callback = type_not_found_callback
         self._auto_reconnect_callback = auto_reconnect_callback
         self._connect_lock = asyncio.Lock()
         self._ping = None
@@ -553,6 +555,13 @@ class MTProtoSender:
                 # Received object which we don't know how to deserialize
                 self._log.info('Type %08x not found, remaining data %r',
                                e.invalid_constructor_id, e.remaining)
+                # Most likely another program switched the API layer of this
+                # authorization key; let the client re-initialize it.
+                if self._type_not_found_callback:
+                    try:
+                        self._type_not_found_callback(self, e)
+                    except Exception:
+                        self._log.exception('Unhandled error in type_not_found_callback')
                 continue
             except SecurityError as e:
                 # A step while decoding had the incorrect data. This message

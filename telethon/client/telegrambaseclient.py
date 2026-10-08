@@ -3,6 +3,7 @@ import inspect
 import re
 import asyncio
 import collections
+import copy
 import logging
 import platform
 import time
@@ -11,7 +12,7 @@ import datetime
 import pathlib
 import warnings
 
-from .. import utils, version, helpers, __name__ as __base_name__
+from .. import utils, version, helpers, errors, __name__ as __base_name__
 from ..crypto import rsa
 from ..extensions import markdown
 from ..network import MTProtoSender, Connection, ConnectionTcpFull, TcpMTProxy
@@ -34,6 +35,10 @@ if typing.TYPE_CHECKING:
     from .telegramclient import TelegramClient
 
 _base_log = logging.getLogger(__base_name__)
+
+# In seconds, unreadable updates received this soon after re-initializing the
+# connection layer are assumed to have been sent before it took effect.
+_LAYER_RECOVERY_GRACE = 10
 
 
 # In seconds, how long to wait before disconnecting a exported sender.
@@ -230,6 +235,23 @@ class TelegramBaseClient(abc.ABC):
             Setting this limit too low will cause the library to attempt to
             flush entities to the session file even if no entities can be
             removed from the in-memory cache, which will degrade performance.
+
+        init_params (`dict`, optional):
+            Extra ``params`` of :tl:`InitConnection` (e.g. ``tz_offset``,
+            ``perf_cat``), converted to a :tl:`JsonObject`.
+
+        layer_recovery_limit (`int`, optional):
+            Telegram stores the API layer per authorization key, so another
+            program using the same session with another layer makes Telegram
+            send objects this library cannot read (`TypeNotFoundError`).
+            When that happens the connection is re-initialized with our layer
+            and the request is retried once. This is the maximum amount of
+            such re-initializations per `layer_recovery_window`; after that
+            `LayerConflictError` is raised. Defaults to 3; 0 disables it.
+
+        layer_recovery_window (`float`, optional):
+            The window, in seconds, for `layer_recovery_limit`.
+            Defaults to 600 (10 minutes).
     """
 
     # Current TelegramClient version
@@ -270,7 +292,9 @@ class TelegramBaseClient(abc.ABC):
             receive_updates: bool = True,
             catch_up: bool = False,
             entity_cache_limit: int = 5000,
-            init_params: dict = None
+            init_params: dict = None,
+            layer_recovery_limit: int = 3,
+            layer_recovery_window: float = 600
     ):
         if not api_id or not api_hash:
             raise ValueError(
@@ -444,6 +468,14 @@ class TelegramBaseClient(abc.ABC):
         self._mb_entity_cache = MbEntityCache()  # required for proper update handling (to know when to getDifference)
         self._entity_cache_limit = entity_cache_limit
 
+        # Recovery from a foreign API layer (see `_recover_layer`).
+        self._layer_recovery_limit = layer_recovery_limit
+        self._layer_recovery_window = layer_recovery_window
+        self._layer_recoveries = collections.deque()  # monotonic times of recent re-inits
+        self._layer_recovery_generation = 0
+        self._layer_recovery_lock = asyncio.Lock()
+        self._layer_recovery_task = None
+
         self._sender = MTProtoSender(
             self.session.auth_key,
             loggers=self._log,
@@ -453,7 +485,8 @@ class TelegramBaseClient(abc.ABC):
             connect_timeout=self._timeout,
             auth_key_callback=self._auth_key_callback,
             updates_queue=self._updates_queue,
-            auto_reconnect_callback=self._handle_auto_reconnect
+            auto_reconnect_callback=self._handle_auto_reconnect,
+            type_not_found_callback=self._handle_unknown_pushed_type
         )
 
 
@@ -804,7 +837,8 @@ class TelegramBaseClient(abc.ABC):
         await self._sender.disconnect()
         await helpers._cancel(self._log[__name__],
                               updates_handle=self._updates_handle,
-                              keepalive_handle=self._keepalive_handle)
+                              keepalive_handle=self._keepalive_handle,
+                              layer_recovery_task=self._layer_recovery_task)
 
     async def _switch_dc(self: 'TelegramClient', new_dc):
         """
@@ -829,6 +863,91 @@ class TelegramBaseClient(abc.ABC):
         """
         self.session.auth_key = auth_key
         await utils.maybe_async(self.session.save())
+
+    # endregion
+
+    # region Layer recovery
+
+    async def _reinit_layer(self: 'TelegramClient', sender):
+        """
+        Re-sends ``invokeWithLayer(LAYER, [invokeWithoutUpdates](initConnection(help.getConfig)))``
+        on ``sender`` like `connect` does, using a copy of ``_init_request``
+        so that the device fingerprint and ``init_params`` stay the same.
+        """
+        init = copy.copy(self._init_request)
+        init.query = functions.help.GetConfigRequest()
+        req = init
+        if self._no_updates:
+            req = functions.InvokeWithoutUpdatesRequest(req)
+        await sender.send(functions.InvokeWithLayerRequest(LAYER, req))
+
+    async def _recover_layer(self: 'TelegramClient', sender, error, generation):
+        """
+        Called when Telegram sent an object this layer does not know.
+
+        Telegram stores the layer per authorization key: the connection that
+        sent the last ``invokeWithLayer(initConnection(...))`` decides the
+        layer of the objects sent to every connection of that key, even after
+        it disconnects. So when another program uses the same session with
+        another layer, we receive objects we cannot read. Re-initializing the
+        connection switches the layer back (and makes the other program fail
+        on its side), so it is capped: after ``layer_recovery_limit`` re-inits
+        within ``layer_recovery_window`` seconds, `LayerConflictError` is raised.
+
+        ``generation`` is ``_layer_recovery_generation`` as seen before the
+        failed request was sent. Returns `True` if the caller should retry.
+        """
+        if self._layer_recovery_limit <= 0:
+            return False
+
+        async with self._layer_recovery_lock:
+            if self._layer_recovery_generation != generation:
+                # Someone else re-initialized after our request was sent.
+                return True
+
+            now = time.monotonic()
+            while self._layer_recoveries and now - self._layer_recoveries[0] > self._layer_recovery_window:
+                self._layer_recoveries.popleft()
+
+            if len(self._layer_recoveries) >= self._layer_recovery_limit:
+                raise errors.LayerConflictError(
+                    error.invalid_constructor_id, error.remaining,
+                    LAYER, len(self._layer_recoveries)) from error
+
+            self._layer_recoveries.append(now)
+            self._layer_recovery_generation += 1
+            self._log[__name__].warning(
+                'Telegram sent an object of another API layer (constructor %08x); another program '
+                'likely used this session with a different layer. Re-initializing with layer %d',
+                error.invalid_constructor_id & 0xffffffff, LAYER)
+            await self._reinit_layer(sender)
+            return True
+
+    def _handle_unknown_pushed_type(self: 'TelegramClient', sender, error):
+        """
+        Callback for objects the sender could not read outside of a response
+        (i.e. updates). There is no request to retry, and these updates would
+        be silently dropped until the next getDifference, which may be a long
+        time if every update is unreadable, so recover in the background.
+        """
+        if self._layer_recovery_limit <= 0:
+            return
+        if self._layer_recovery_task and not self._layer_recovery_task.done():
+            return
+        # Updates sent before the last re-init took effect may still arrive.
+        if self._layer_recoveries and time.monotonic() - self._layer_recoveries[-1] < _LAYER_RECOVERY_GRACE:
+            return
+
+        self._layer_recovery_task = helpers.get_running_loop().create_task(
+            self._recover_layer_in_background(sender, error, self._layer_recovery_generation))
+
+    async def _recover_layer_in_background(self: 'TelegramClient', sender, error, generation):
+        try:
+            await self._recover_layer(sender, error, generation)
+        except errors.LayerConflictError as e:
+            self._log[__name__].error('%s', e)
+        except Exception:
+            self._log[__name__].exception('Failed to re-initialize the connection with layer %d', LAYER)
 
     # endregion
 

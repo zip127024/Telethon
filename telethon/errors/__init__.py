@@ -5,7 +5,7 @@ Telegram API has. See telethon_generator/errors.json for more.
 import re
 
 from .common import (
-    ReadCancelledError, TypeNotFoundError, InvalidChecksumError,
+    ReadCancelledError, TypeNotFoundError, LayerConflictError, InvalidChecksumError,
     InvalidBufferError, AuthKeyNotFound, SecurityError, CdnFileTamperedError,
     AlreadyInConversationError, BadMessageError, MultiError
 )

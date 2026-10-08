@@ -8,6 +8,7 @@ from .. import errors, helpers, utils, hints
 from ..errors import MultiError, RPCError
 from ..helpers import retry_range
 from ..tl import TLRequest, types, functions
+from ..tl.alltlobjects import LAYER
 
 _NOT_A_REQUEST = lambda: TypeError('You can only invoke requests, not types!')
 
@@ -30,6 +31,27 @@ class UserMethods:
         return await self._call(self._sender, request, ordered=ordered)
 
     async def _call(self: 'TelegramClient', sender, request, ordered=False, flood_sleep_threshold=None):
+        # Fork: an object of an unknown type most likely means another program
+        # switched the API layer of the session; re-initialize and retry once.
+        generation = self._layer_recovery_generation
+        try:
+            return await self._call_unguarded(sender, request, ordered, flood_sleep_threshold)
+        except errors.TypeNotFoundError as e:
+            if isinstance(e, errors.LayerConflictError) \
+                    or not await self._recover_layer(sender, e, generation):
+                raise
+
+        try:
+            return await self._call_unguarded(sender, request, ordered, flood_sleep_threshold)
+        except errors.TypeNotFoundError as e:
+            if isinstance(e, errors.LayerConflictError):
+                raise
+            # The layer was switched back right away (or the type is unknown
+            # for another reason); don't fight over it on every request.
+            raise errors.LayerConflictError(
+                e.invalid_constructor_id, e.remaining, LAYER, len(self._layer_recoveries)) from e
+
+    async def _call_unguarded(self: 'TelegramClient', sender, request, ordered=False, flood_sleep_threshold=None):
         if self._loop is not None and self._loop != helpers.get_running_loop():
             raise RuntimeError('The asyncio event loop must not change after connection (see the FAQ for details)')
         # if the loop is None it will fail with a connection error later on

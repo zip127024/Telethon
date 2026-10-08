@@ -27,6 +27,37 @@ class TypeNotFoundError(Exception):
         self.remaining = remaining
 
 
+class LayerConflictError(TypeNotFoundError):
+    """
+    Occurs when Telegram keeps sending objects of another API layer even
+    after the connection was re-initialized with the layer of this library.
+
+    Telegram stores the layer per authorization key: the connection that
+    sent the last ``invokeWithLayer(initConnection(...))`` decides the layer
+    of the objects sent to *every* connection of that key. This error means
+    another program (with a different Telethon or Pyrogram version) is using
+    the same session at the same time and keeps switching it to its layer.
+    Stop that program or use a different session.
+    """
+    def __init__(self, invalid_constructor_id, remaining, layer=None, recoveries=0):
+        super().__init__(invalid_constructor_id, remaining)
+        Exception.__init__(
+            self,
+            'Telegram keeps sending objects of another API layer (constructor '
+            '{:08x}) although the connection was re-initialized with layer {} '
+            '({} time(s) recently). Another program is likely using the same '
+            'session with a different Telethon/Pyrogram version; close it or '
+            'use a different session.'.format(
+                invalid_constructor_id & 0xffffffff, layer, recoveries))
+
+        self.layer = layer
+        self.recoveries = recoveries
+
+    def __reduce__(self):
+        return type(self), (self.invalid_constructor_id, self.remaining,
+                            self.layer, self.recoveries)
+
+
 class InvalidChecksumError(Exception):
     """
     Occurs when using the TCP full mode and the checksum of a received
